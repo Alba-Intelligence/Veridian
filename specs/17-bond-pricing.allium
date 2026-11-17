@@ -1,0 +1,184 @@
+-- allium: 3
+-- 17-bond-pricing.allium
+
+-- Scope: Valuation of fixed-coupon bonds with bullet redemption, and of the
+--   same bonds with an issuer call (callable bonds) (D-022, D-046).
+-- Includes: what a valuation needs, what it must return (including the
+--   quoting measures and the default-risk inputs of spec 11), how the issuer
+--   credit curve and the rate model are used, how life-cycle events are
+--   handled, how the planner expands a bond request.
+-- Excludes:
+--   - The trade and security payload fields: generated from the Julia types
+--     (D-018); static data enters through spec 16.
+--   - Curves, the issuer credit curve, the swaption cube and the Hull-White
+--     calibration themselves (08).
+--   - Sensitivities and FRTB aggregation (11): bumped graph nodes (D-032).
+--   - Floating-rate, amortising, inflation-linked, convertible and putable
+--     bonds; make-whole calls (see PlainVanillaOnly).
+-- Dependencies: 01, 02, 03, 08.
+--
+-- Planning (D-020), one pass, for one bond position version:
+--   calendars named by the security (03) -> discount curve of the bond's
+--   currency (08) -> issuer credit curve for issuer and seniority (08,
+--   prerequisite: discount curve) -> for a callable bond also the swaption
+--   cube and the Hull-White calibration in the bond's currency (08,
+--   prerequisite: discount curve) -> valuation node (this spec). The market
+--   price series of the security, when one exists, is an input of the
+--   valuation node.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract BondValuation {
+    value: (position: data/InputVersion, security: data/InputVersion, as_of: Timestamp, discount_curve: String, credit_curve: String, rate_model: String?, market_price: data/InputVersion?, calendars: Set<data/InputVersion>, reporting_currencies: Set<String>, fx: Set<String>) -> String
+
+    @invariant ScheduleFromTerms
+        -- The coupon schedule comes from the security's terms via the
+        -- calendar contract (03): coupon dates, frequency, day count,
+        -- business day adjustment, first and last stubs, payment lags.
+
+    @invariant RiskyDiscounting
+        -- Each cashflow is discounted on the risk-free curve of the bond's
+        -- currency and weighted by the survival probability from the credit
+        -- curve of its issuer and seniority; the recovery on default is part
+        -- of that credit curve object (08), so the valuation and the default
+        -- risk charge (11) read one credit view (D-046). An issuer with no credit
+        -- curve is a deterministic rejection naming the issuer, never a
+        -- silent default of the spread (proxy rule: open question in 08).
+
+    @invariant BulletRedemption
+        -- Redemption is the whole notional at maturity at par, together with
+        -- the last coupon. Cashflows paying on as_of are included ("for
+        -- value", D-033).
+
+    @invariant CallableByHullWhite
+        -- A callable bond is the straight bond less the issuer's call option.
+        -- The call option is valued on a one-factor Hull-White lattice whose
+        -- volatility is calibrated to the swaption cube (08) at each run and
+        -- whose mean reversion is fixed by the model recipe, a configuration
+        -- artefact reviewed with the model (D-054); the call schedule (European
+        -- or Bermudan), the notice periods and the call prices come from the
+        -- terms. The straight bond inside the same lattice must reproduce the
+        -- straight-bond PV within the recipe's tolerance, or the valuation is
+        -- rejected (consistency of the lattice with the curve).
+
+    @invariant DeterministicLattice
+        -- The lattice has a number of steps fixed by the recipe, never chosen
+        -- adaptively; evaluation is single-threaded and reproducible (02,
+        -- DeterministicComputation). Rounding follows the canonical rounding
+        -- (D-015); prescribed formulas follow their source exactly and cite
+        -- it (F-3).
+
+    @invariant SeasonedBondsAreOpenOnly
+        -- Cashflows paid before as_of play no part. A bond past its final
+        -- payment at as_of is a deterministic rejection saying it matured
+        -- (the position should have been closed by a succession, D-023). In
+        -- a batch run the matured position is excluded and listed as an
+        -- explicit exclusion naming the position (16, ExplicitExclusions), so
+        -- that someone closes it and the run is not stopped (D-054).
+
+    @invariant LifeCycleThroughSuccession
+        -- Partial redemption (notional reduction), exercise of a call,
+        -- redemption at maturity, issuer change and amendment arrive as
+        -- successions of the position (D-023); the valuation always uses the
+        -- position version effective at as_of. An issuer default arrives as
+        -- a succession into a defaulted position, valued at a recovery price
+        -- (an input) plus the accrued claim, and leaves the credit-curve
+        -- valuation; a called bond that is not yet redeemed remains a bond,
+        -- valued to its call date at the call price, until a succession
+        -- records the redemption (D-054).
+
+    @invariant ResultShape
+        -- The valuation result contains (D-046): PV in local currency (the
+        -- position currency) and in each requested reporting currency with the
+        -- FX object used (D-033); clean and dirty price per 100 of nominal and
+        -- as amounts; accrued interest; the cashflow table (accrual start and
+        -- end, payment date, notional, year fraction as exact rational,
+        -- coupon, discount factor, survival probability, PV in local
+        -- currency); yield to maturity under the convention named in the
+        -- terms; for callable bonds also the straight-bond PV, the option
+        -- value, the option-adjusted spread and the lattice recipe hash;
+        -- and the basis of the credit curve used (quoted CDS, bond-implied
+        -- or proxy, with the proxy key when it is a proxy, 08).
+        -- When a market price exists: the z-spread (straight bond) and the
+        -- option-adjusted spread (callable) that reproduce that price on the
+        -- risk-free curve. Without a market price these are reported as absent
+        -- with the reason, never as zero and never as a rejection.
+
+    @invariant DefaultRiskInputs
+        -- The result carries the inputs spec 11 needs for the default risk
+        -- charge, so no second valuation is made: issuer, seniority, the
+        -- recovery rate used, notional, and the fair value (dirty PV in local
+        -- currency) as the basis for the jump-to-default amount.
+
+    @invariant InformationalRiskMeasures
+        -- Effective duration, convexity and PV01 are reported for desks. They
+        -- are informational: regulatory sensitivities always come from the
+        -- prescribed shocked graph nodes (D-032) and never from these figures.
+
+    @invariant YieldConventionNamed
+        -- The yield to maturity is computed under the convention named in
+        -- the terms (its edition included); the formula follows its source
+        -- document exactly (F-3). The default convention is yield compounded
+        -- at the coupon frequency on the bond's day count, from the clean
+        -- price (D-054); the terms of a bond may name another.
+
+    @invariant PlainVanillaOnly
+        -- v1 (D-046): fixed coupon, constant notional until a succession,
+        -- single currency, bullet redemption at par, no ex-coupon period,
+        -- call prices stated in the terms (no make-whole). Other terms are a
+        -- deterministic rejection naming the feature.
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor PricingWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface BondValuationComputation {
+    facing worker: PricingWorker
+
+    contracts:
+        demands BondValuation
+        demands graph/DeterministicComputation
+
+    @guarantee GoldenCrossCheck
+        -- Golden bullet and callable bond valuations are reproduced
+        -- independently (QuantLib, D-010) within a stated tolerance before a
+        -- model version can enter a production release. Property checks that
+        -- hold without a reference: a callable bond is never worth more than
+        -- the same straight bond; a call price far above the straight value
+        -- makes the option worthless; shifting the credit curve to zero
+        -- spread gives the risk-free PV.
+
+    @guarantee UpstreamContribution
+        -- The lattice engine, the callable bond and the yield conventions are
+        -- generic and live in a separate package free of Veridian
+        -- dependencies, offered to JuliaActuary first (D-031).
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-046): risky discounting with the issuer credit curve; Hull-White
+-- one-factor lattice for calls; result shape as above, including default-risk
+-- inputs and informational risk measures.
+-- Resolved (D-054): default yield convention is compounded at coupon
+-- frequency on the bond day count from the clean price; an issuer default is
+-- a succession and a called bond stays a bond until redeemed; a matured bond
+-- is excluded and listed; Hull-White volatility is calibrated and mean
+-- reversion fixed by recipe.
+open question "Which edition of the yield convention does the bank quote by in each market, and which markets need a convention other than the default?"
+open question "Hull-White mean reversion value and the number of lattice steps and tolerance per currency: the recipe's values, to be set when the model is validated (21)."

@@ -1,0 +1,516 @@
+-- allium: 3
+-- 21-model-risk-management.allium
+
+-- Scope: Governance of the models that price and aggregate: which models
+--   exist, who owns them, who has validated them independently, how they are
+--   monitored once in production, and what stops a model that has not been
+--   validated from reaching production (D-050).
+-- Includes: the model inventory with risk tiers, independent validation
+--   records and their expiry, conditions attached to a validation, scheduled
+--   benchmark runs against the independent reference, breaches and their
+--   review, the gate on production releases, the rule against overrides.
+-- Excludes:
+--   - How a validator validates: the bank's validation function does the
+--     work; Veridian records outcome, scope, conditions and evidence.
+--   - The models' own content and golden cross-checks (09, 17, 18): reused.
+--   - FRTB-SA back-testing: the standardised approach has none, so none is
+--     specified.
+--   - Overlays or manual adjustments of results: not allowed (see below).
+-- Dependencies: 01, 02, 05, 13.
+--
+-- Principles (D-050):
+--   - Models, owners and tiers are configuration, registered when a release
+--     activates, like schedules and perimeters. Validations and benchmark
+--     results are records the platform keeps at runtime, because they happen
+--     after the code is written.
+--   - A model version is an exact code hash (02). Validation attaches to a
+--     version, so a changed model is not covered by the old validation.
+--   - Independence is enforced, not assumed: the validator is neither the
+--     model's owner nor the author of the release that carried it.
+--   - There are no overrides. A figure is always reproducible from inputs
+--     (02, 19); a model's known limitations are recorded and enforced as
+--     restrictions, and any adjustment belongs to the bank's own downstream
+--     process outside Veridian.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./13-report-review-alerts-trends.allium" as review
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- high: models that drive regulatory capital or whose failure is hard to
+-- see (lattice, calibration, FRTB aggregation). medium and low: simpler
+-- models. The tier sets how often a model is validated and benchmarked.
+enum ModelTier { high | medium | low }
+
+enum ValidationOutcome { approved | approved_with_conditions | rejected }
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract ModelGovernance {
+    @invariant ScopeEnforced
+        -- A validation states the scope the model is approved for: instrument
+        -- kinds, currencies, tenors and moneyness ranges, data classes. The
+        -- planner rejects a position outside it with a deterministic
+        -- rejection naming the model and the limit (02, ComputationRejected);
+        -- it never prices outside the approved scope silently.
+
+    @invariant NoOverrides
+        -- No user can replace, adjust or add to a calculated result. There is
+        -- no overlay entity and no field a result can be edited in; a
+        -- different answer is a different model version or different inputs.
+
+    @invariant ConditionsAreTracked
+        -- Conditions on an approval are either restrictions of the scope
+        -- (enforced as above) or remediation with a due date, which raises an
+        -- alert to the model's owner when overdue.
+
+    @invariant ValidationFollowsCode
+        -- A validation attaches to one model version (one code hash). A new
+        -- version is validated afresh; a release that merely carries an
+        -- unchanged version forward keeps its validation (02).
+
+    @invariant IndependentReference
+        -- Benchmark runs compare the model with the independent reference
+        -- (the QuantLib vectors and runs of D-010 and D-049), never with the
+        -- same code under another name.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A model in the inventory: defined in a configuration release.
+entity ModelInventoryEntry {
+    function_name: String
+    owner: data/User
+    tier: ModelTier
+    purpose: String
+    definition_hash: String
+    release: cfg/ConfigurationRelease
+    next_benchmark_due: Timestamp?
+    status: in_inventory | retired
+
+    transitions status {
+        in_inventory -> retired
+        terminal: retired
+    }
+}
+
+-- An independent validation of one model version.
+entity ModelValidation {
+    entry: ModelInventoryEntry
+    model_version: graph/ModelVersion
+    validator: data/User
+    outcome: ValidationOutcome
+    -- What the model is approved for, as a content hash of the scope
+    -- document (instrument kinds, ranges, data classes).
+    scope_hash: String
+    conditions: String?
+    conditions_due_at: Timestamp?
+    -- The largest difference to the independent reference that still counts
+    -- as agreement, set by the validator.
+    benchmark_tolerance: Decimal
+    evidence_ref: String
+    validated_at: Timestamp
+    valid_until: Timestamp
+    state: current | expired | superseded | withdrawn
+
+    transitions state {
+        current -> expired
+        current -> superseded
+        current -> withdrawn
+        terminal: expired, superseded, withdrawn
+    }
+}
+
+-- One scheduled comparison with the independent reference.
+entity BenchmarkRun {
+    entry: ModelInventoryEntry
+    validation: ModelValidation
+    cases: Integer
+    max_difference: Decimal
+    tolerance: Decimal
+    within_tolerance: Boolean
+    run_at: Timestamp
+}
+
+-- A benchmark outside tolerance. While open, no production release carrying
+-- the model can be activated.
+entity ModelBreach {
+    entry: ModelInventoryEntry
+    benchmark: BenchmarkRun
+    raised_at: Timestamp
+    reviewed_by: data/User?
+    review_note: String?
+    state: open | reviewed
+
+    transitions state {
+        open -> reviewed
+        terminal: reviewed
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+-- Defaults are placeholders for the bank's own model risk policy.
+config {
+    validation_interval_high: Duration = 365.days
+    validation_interval_medium: Duration = 730.days
+    validation_interval_low: Duration = 1095.days
+    benchmark_interval_high: Duration = 7.days
+    benchmark_interval_medium: Duration = 30.days
+    benchmark_interval_low: Duration = 90.days
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- The inventory comes only from configuration releases.
+rule RegisterReleaseInventory {
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for d in release_inventory(release):
+            InventoryEntryDefined(release: release, definition: d)
+        for e in inventory_dropped_by(release):
+            InventoryEntryDropped(entry: e)
+}
+
+rule CreateInventoryEntry {
+    when: InventoryEntryDefined(release, definition)
+    requires: not exists ModelInventoryEntry{definition_hash: inventory_definition_hash(definition)}
+    ensures: ModelInventoryEntry.created(
+        function_name: inventory_function_name(definition),
+        owner: inventory_owner(definition),
+        tier: inventory_tier(definition),
+        purpose: inventory_purpose(definition),
+        definition_hash: inventory_definition_hash(definition),
+        release: release,
+        next_benchmark_due: null,
+        status: in_inventory
+    )
+}
+
+rule RetireInventoryEntry {
+    when: InventoryEntryDropped(entry)
+    requires: entry.status = in_inventory
+    ensures: entry.status = retired
+}
+
+-- Validation is recorded by a person from the validation function who is
+-- neither the owner nor the author of the release that carried the version.
+rule RecordValidation {
+    -- model: release_gate.recordValidation
+    when: ValidationRecorded(validator, entry, model_version, outcome, scope_hash, conditions?, conditions_due_at?, benchmark_tolerance, evidence_ref)
+    requires: entry.status = in_inventory
+    requires: model_version.function_name = entry.function_name
+    requires: data/permitted(validator, "model.validate", entry.function_name)
+    requires: data/freshly_authenticated(validator)
+    requires: validator != entry.owner
+    requires: validator != model_version.first_release.authored_by
+    requires: outcome = approved_with_conditions implies conditions != null
+    requires: benchmark_tolerance > 0
+    ensures: ModelValidation.created(
+        entry: entry,
+        model_version: model_version,
+        validator: validator,
+        outcome: outcome,
+        scope_hash: scope_hash,
+        conditions: conditions,
+        conditions_due_at: conditions_due_at,
+        benchmark_tolerance: benchmark_tolerance,
+        evidence_ref: evidence_ref,
+        validated_at: now,
+        valid_until: now + validation_interval(entry.tier),
+        state: current
+    )
+}
+
+-- Exactly one current validation per model version.
+rule SupersedePreviousValidation {
+    when: validation: ModelValidation.created
+    ensures: ValidationSuperseding(
+        entry: validation.entry,
+        model_version: validation.model_version,
+        keep: validation
+    )
+}
+
+rule SupersedeOne {
+    when: ValidationSuperseding(entry, model_version, keep)
+    ensures:
+        for old in other_current_validations(model_version, keep):
+            ValidationReplaced(validation: old)
+}
+
+rule ReplaceValidation {
+    when: ValidationReplaced(validation)
+    requires: validation.state = current
+    ensures: validation.state = superseded
+}
+
+-- A validation runs out: the owner is told at once. Releases already in
+-- production keep running (a regulatory run is never stopped by a clock), but
+-- no production release carrying this version can be activated until it is
+-- validated again (05, gate below).
+rule ValidationExpires {
+    -- model: release_gate.expire
+    when: validation: ModelValidation.valid_until <= now
+    requires: validation.state = current
+    ensures:
+        validation.state = expired
+        review/Alert.created(
+            source: run_problem,
+            subject_ref: validation.entry.function_name,
+            description: "model validation has expired",
+            raised_at: now,
+            owner: validation.entry.owner,
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule WithdrawValidation {
+    -- model: release_gate.withdraw
+    when: ValidationWithdrawn(validator, validation, reason)
+    requires: validation.state = current
+    requires: data/permitted(validator, "model.validate", validation.entry.function_name)
+    requires: data/freshly_authenticated(validator)
+    ensures:
+        validation.state = withdrawn
+        review/Alert.created(
+            source: run_problem,
+            subject_ref: validation.entry.function_name,
+            description: reason,
+            raised_at: now,
+            owner: validation.entry.owner,
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule ConditionsOverdue {
+    when: validation: ModelValidation.conditions_due_at <= now
+    requires: validation.state = current
+    requires: validation.outcome = approved_with_conditions
+    ensures: review/Alert.created(
+        source: run_problem,
+        subject_ref: validation.entry.function_name,
+        description: "condition of a model validation is overdue",
+        raised_at: now,
+        owner: validation.entry.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+-- Benchmarking: scheduled by tier against the independent reference.
+rule BenchmarkDue {
+    when: entry: ModelInventoryEntry.next_benchmark_due <= now
+    requires: entry.status = in_inventory
+    ensures: BenchmarkRequested(entry: entry)
+}
+
+rule RecordBenchmark {
+    when: BenchmarkRecorded(worker, entry, validation, cases, max_difference)
+    requires: validation.entry = entry
+    requires: validation.state = current
+    requires: data/permitted(worker, "model.benchmark", entry.function_name)
+    ensures:
+        BenchmarkRun.created(
+            entry: entry,
+            validation: validation,
+            cases: cases,
+            max_difference: max_difference,
+            tolerance: validation.benchmark_tolerance,
+            within_tolerance: max_difference <= validation.benchmark_tolerance,
+            run_at: now
+        )
+        entry.next_benchmark_due = now + benchmark_interval(entry.tier)
+}
+
+rule RaiseBreach {
+    -- model: release_gate.benchmarkOutside
+    when: run: BenchmarkRun.created
+    requires: not run.within_tolerance
+    ensures:
+        ModelBreach.created(
+            entry: run.entry,
+            benchmark: run,
+            raised_at: now,
+            state: open
+        )
+        review/Alert.created(
+            source: run_problem,
+            subject_ref: run.entry.function_name,
+            description: "model benchmark outside tolerance",
+            raised_at: now,
+            owner: run.entry.owner,
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule ReviewBreach {
+    -- model: release_gate.reviewBreach
+    when: BreachReviewed(reviewer, breach, note)
+    requires: breach.state = open
+    requires: data/permitted(reviewer, "model.validate", breach.entry.function_name)
+    requires: reviewer != breach.entry.owner
+    requires: data/freshly_authenticated(reviewer)
+    ensures:
+        breach.state = reviewed
+        breach.reviewed_by = reviewer
+        breach.review_note = note
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ValidatorIsIndependent {
+    -- model: release_gate.validatorIndependent
+    for v in ModelValidations:
+        v.validator != v.entry.owner
+            and v.validator != v.model_version.first_release.authored_by
+}
+
+invariant ReviewerIsIndependent {
+    -- model: release_gate.reviewerIndependent
+    for b in ModelBreachs:
+        b.state = reviewed implies b.reviewed_by != b.entry.owner
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ModelValidator {
+    identified_by: data/User
+}
+
+actor ModelOwner {
+    identified_by: data/User
+}
+
+actor BenchmarkWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ModelValidation_ {
+    facing validator: ModelValidator
+    context validation: ModelValidation
+
+    exposes:
+        validation.entry.function_name
+        validation.entry.tier
+        validation.model_version.version
+        validation.outcome
+        validation.scope_hash
+        validation.conditions
+        validation.conditions_due_at
+        validation.benchmark_tolerance
+        validation.valid_until
+        validation.state
+
+    provides:
+        ValidationRecorded(validator, entry, model_version, outcome, scope_hash, conditions?, conditions_due_at?, benchmark_tolerance, evidence_ref)
+        ValidationWithdrawn(validator, validation, reason) when validation.state = current
+}
+
+surface ModelBreaches {
+    facing validator: ModelValidator
+    context breach: ModelBreach
+
+    exposes:
+        breach.entry.function_name
+        breach.benchmark.max_difference
+        breach.benchmark.tolerance
+        breach.raised_at
+        breach.state
+
+    provides:
+        BreachReviewed(validator, breach, note) when breach.state = open
+}
+
+surface ModelInventoryView {
+    facing owner: ModelOwner
+    context entry: ModelInventoryEntry where owner = owner
+
+    exposes:
+        entry.function_name
+        entry.tier
+        entry.purpose
+        entry.next_benchmark_due
+        entry.status
+        current_validation_of(entry)
+        open_breaches_of(entry)
+
+    contracts:
+        demands ModelGovernance
+}
+
+surface BenchmarkComputation {
+    facing worker: BenchmarkWorker
+
+    provides:
+        BenchmarkRecorded(worker, entry, validation, cases, max_difference)
+
+    @guarantee ReferenceIsIndependent
+        -- The worker's reference values come from the independent
+        -- implementation, with its inputs frozen (D-049); a benchmark that
+        -- used the model's own code is not accepted.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- release_inventory(release), inventory_* accessors, inventory_dropped_by:
+--   from the release artefacts (05): the inventory entries a release defines,
+--   and the entries the previous release had that this one no longer lists.
+-- validation_interval(tier), benchmark_interval(tier): the configuration
+--   values above by tier.
+-- other_current_validations(model_version, keep): the other validations in
+--   state current for that version.
+-- current_validation_of, open_breaches_of: queries.
+-- BenchmarkRequested: event for the benchmark worker (a graph request of the
+--   benchmark job), by tier.
+-- models_cleared(release): used by spec 05's gate, true when every model
+--   version (the graph model version, D-060) the release adds or changes,
+--   compared with the active release of
+--   that kind, has a current validation with outcome approved or
+--   approved_with_conditions whose scope covers the release's use, and its
+--   inventory entry has no open breach. Versions carried forward unchanged are
+--   not looked at, so a release that changes no model always passes (D-058).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-050): inventory with tiers; validation by someone independent
+-- of owner and release author; scheduled benchmarks against the independent
+-- reference with a gate on production releases; no overrides.
+open question "The bank's own tiering criteria, validation and benchmark intervals (the defaults are placeholders): confirm against its model risk policy (e.g. SR 11-7, PRA SS1/23, ECB guide)."
+-- Resolved (D-054): a withdrawn validation or an unresolved breach blocks new
+-- releases only; the model in the active release keeps running, the finding
+-- is flagged on every run that uses the model and escalated, and a new
+-- release is the way to replace it.
+open question "A validation that is overdue for long: should the model be suspended after a grace period?"
+open question "Who is the bank's validation function and is it separate from the quant team that owns the models?"
+open question "Retention of validation records and benchmark results: same 10 years as reported figures (13), to be confirmed with compliance."
+-- Resolved (D-058): the release gate applies to the model versions a release adds or changes, compared with the active release; unchanged versions are not looked at, so one lapsed validation no longer blocks a release that changes no model (found by the release-gate model, models/README.md).
+-- Resolved (D-060): a model version is the graph model version (spec 02), the one that enters calc_id. A version is new or changed when the graph model version in the release differs from the one in the active release of that kind. The inventory entry records the graph model version a validation was made against, so validation follows the executing code. A release that removes a model needs no validation but names the removal.
+open question "A graph model version bump that changes no behaviour (refactoring) needs a fresh validation under D-060. Is a lighter path wanted, for example a validator confirming equivalence on the golden vectors, or is a full revalidation accepted?"

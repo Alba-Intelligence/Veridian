@@ -1,0 +1,295 @@
+-- allium: 3
+-- 14-trader-dashboards.allium
+
+-- Scope: Live and on-demand risk views for traders, and pre-trade what-if
+--   (D-038).
+-- Includes: desk views over entitled books, recomputation when trades or
+--   market data change and on request, what-if scenarios with hypothetical
+--   trades and market shifts, the unofficial status of everything shown here.
+-- Excludes:
+--   - Official figures: only batch runs are published and signed off (06, 13).
+--   - Real-time market data feeds: none in v1 (D-034); "live" means the
+--     latest recorded versions.
+-- Dependencies: 01, 02, 11, 12.
+--
+-- What a view shows (D-038): PV (clean and dirty, local and reporting
+-- currencies), cashflows, sensitivities by tenor and bucket, and the desk's
+-- standalone FRTB capital. Everything is computed through the ordinary
+-- calculation graph, so unchanged positions and shared curves are memo hits
+-- and only what changed is recomputed. Requests run at interactive priority
+-- (D-030).
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./12-web-front-end-and-batch-console.allium" as web
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract DashboardService {
+    view_results: (view_ref: String, request_ref: String) -> String
+
+    @invariant Unofficial
+        -- Every figure on a desk view or what-if screen is marked unofficial
+        -- with its as_of and known_at; none becomes a publication (06) or a
+        -- reported figure (13).
+
+    @invariant ResponseTarget
+        -- A refresh of a desk view of 1,000 swaps shows results within
+        -- config.refresh_target when market objects are already computed;
+        -- every refresh's elapsed time is recorded so the target can be
+        -- monitored.
+
+    @invariant WhatifPrivate
+        -- What-if series and results are visible only to their author (and
+        -- to auditors); they never feed any other calculation (02,
+        -- WhatifNeverLeaks).
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A trader's open view over some books. Recomputes when a trade or market
+-- series it depends on changes, at most once per debounce interval.
+entity DeskView {
+    owner: data/User
+    books: Set<String>
+    model: graph/ModelVersion
+    opened_at: Timestamp
+    last_refresh_at: Timestamp?
+    last_activity_at: Timestamp
+    refresh_pending: Boolean
+    view_state: open | closed
+
+    transitions view_state {
+        open -> closed
+        terminal: closed
+    }
+}
+
+-- A trader's hypothetical changes on top of a view: whatif series holding
+-- hypothetical trades and market shifts (01, data class whatif).
+entity WhatIfScenario {
+    author: data/User
+    view: DeskView
+    name: String
+    series: Set<data/InputSeries>
+    created_at: Timestamp
+    scenario_state: drafting | evaluated | discarded
+
+    transitions scenario_state {
+        drafting -> evaluated
+        evaluated -> evaluated
+        drafting -> discarded
+        evaluated -> discarded
+        terminal: discarded
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    refresh_debounce: Duration = 2.seconds
+    refresh_target: Duration = 5.seconds
+    view_idle_close: Duration = 8.hours
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A trader opens a view only over books their grants allow (D-026).
+rule OpenDeskView {
+    when: DeskViewOpened(trader, books, model)
+    requires: books.all(b => data/permitted(trader, "book.read", b))
+    ensures: DeskView.created(
+        owner: trader,
+        books: books,
+        model: model,
+        opened_at: now,
+        last_activity_at: now,
+        refresh_pending: true,
+        view_state: open
+    )
+}
+
+-- A new version of a series the view depends on (trade, quotes, fixings,
+-- calendars) marks it for refresh.
+rule MarkViewsOnChange {
+    when: data/InputChanged(series, version)
+    ensures:
+        for v in DeskViews where view_state = open:
+            if view_depends_on(v, series):
+                v.refresh_pending = true
+}
+
+-- On request, as well as on change.
+rule RequestRefresh {
+    when: RefreshRequested(trader, view)
+    requires: view.owner = trader
+    requires: view.view_state = open
+    ensures:
+        view.refresh_pending = true
+        view.last_activity_at = now
+}
+
+-- Debounced recomputation from the latest recorded versions.
+rule RefreshView {
+    when: view: DeskView.refresh_pending
+    requires: view.view_state = open
+    requires: view.last_refresh_at = null
+        or view.last_refresh_at + config.refresh_debounce <= now
+    ensures:
+        view.refresh_pending = false
+        view.last_refresh_at = now
+        graph/CalculationRequested(
+            requester: view.owner,
+            model: view.model,
+            subjects: view_subjects(view, now),
+            data_class: production,
+            as_of: today_end_of_day(view, now),
+            known_at: now,
+            origin_ref: view_ref_of(view)
+        )
+}
+
+rule CloseIdleView {
+    when: view: DeskView.last_activity_at + config.view_idle_close <= now
+    requires: view.view_state = open
+    ensures: view.view_state = closed
+}
+
+rule CloseView {
+    when: DeskViewClosed(trader, view)
+    requires: view.owner = trader
+    requires: view.view_state = open
+    ensures: view.view_state = closed
+}
+
+-- Hypothetical trades and shifts are recorded as whatif series by their
+-- author (01); a scenario groups them.
+rule CreateWhatIf {
+    when: WhatIfCreated(trader, view, name, series)
+    requires: view.owner = trader
+    requires: view.view_state = open
+    requires: series.all(s => s.data_class = whatif and s.created_by = trader)
+    requires: view.books.all(b => data/permitted(trader, "whatif.create", b))
+    ensures: WhatIfScenario.created(
+        author: trader,
+        view: view,
+        name: name,
+        series: series,
+        created_at: now,
+        scenario_state: drafting
+    )
+}
+
+-- Evaluated as a whatif request: production steps are shared memo hits;
+-- only steps touching hypothetical series are whatif nodes (02).
+rule EvaluateWhatIf {
+    when: WhatIfEvaluationRequested(trader, scenario)
+    requires: scenario.author = trader
+    requires: scenario.scenario_state in {drafting, evaluated}
+    requires: scenario.view.view_state = open
+    ensures:
+        scenario.scenario_state = evaluated
+        graph/CalculationRequested(
+            requester: trader,
+            model: scenario.view.model,
+            subjects: view_subjects(scenario.view, now) + scenario.series,
+            data_class: whatif,
+            as_of: today_end_of_day(scenario.view, now),
+            known_at: now,
+            origin_ref: scenario_ref_of(scenario)
+        )
+}
+
+rule DiscardWhatIf {
+    when: WhatIfDiscarded(trader, scenario)
+    requires: scenario.author = trader
+    requires: scenario.scenario_state in {drafting, evaluated}
+    ensures: scenario.scenario_state = discarded
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Trader {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface DeskDashboard {
+    facing trader: Trader
+    context view: DeskView where owner = trader
+
+    exposes:
+        view.books
+        view.view_state
+        view.last_refresh_at
+        view_results(view)
+        refresh_elapsed(view)
+
+    provides:
+        DeskViewOpened(trader, books, model)
+        RefreshRequested(trader, view) when view.view_state = open
+        DeskViewClosed(trader, view) when view.view_state = open
+        WhatIfCreated(trader, view, name, series) when view.view_state = open
+        web/ExportRequested(trader, view_ref, format)
+
+    contracts:
+        demands DashboardService
+        demands web/WebFrontEnd
+}
+
+surface WhatIfWorkbench {
+    facing trader: Trader
+    context scenario: WhatIfScenario where author = trader
+
+    exposes:
+        scenario.name
+        scenario.scenario_state
+        scenario.series
+        whatif_impact(scenario)
+
+    provides:
+        WhatIfEvaluationRequested(trader, scenario) when scenario.scenario_state in {drafting, evaluated}
+        WhatIfDiscarded(trader, scenario) when scenario.scenario_state in {drafting, evaluated}
+
+    contracts:
+        demands DashboardService
+        demands web/WebFrontEnd
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- view_subjects(view, at): the trade series of the view's books resolved at
+--   `at` (the Julia planner adds market objects).
+-- view_depends_on(view, series): the series is a subject of the view or an
+--   input of its latest plan.
+-- today_end_of_day(view, at): the end-of-day as_of per currency (D-035).
+-- view_results, refresh_elapsed, whatif_impact (difference between the
+--   scenario and its base view), view_ref_of, scenario_ref_of: queries over
+--   the latest requests with that origin_ref.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-038): live = on change plus on demand from the latest recorded
+-- versions; PV, cashflows, sensitivities and desk capital; what-if as a
+-- private data class; all intraday figures unofficial; under 5 s for 1,000
+-- swaps; entitlement by role grants.
+-- Resolved (D-039): whatif series and results are kept until the scenario
+-- is discarded, and never longer than the development retention (D-005);
+-- scenarios are strictly private in v1 (no sharing).

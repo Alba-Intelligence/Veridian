@@ -1,0 +1,553 @@
+-- allium: 3
+-- 04-identity-access-audit.allium
+
+-- Scope: Who may do what in Veridian, and the tamper-evident record of
+--   everything anyone (person or service) did or tried to do (D-009).
+-- Includes: users (people and service identities), roles granted over time,
+--   the permitted(user, action, target) decision used by every other spec,
+--   separation of duties, the hash-chained audit log and its readers.
+-- Excludes:
+--   - Authentication mechanics: an external OIDC identity provider proves who
+--     a person is; this spec starts from an authenticated subject.
+--   - Role-to-rights mapping: configuration as code (D-016); a role's actions
+--     come from the tagged configuration release (black box role_allows).
+--   - Audit storage technology and retention (D-005: configured later).
+-- Dependencies: none (01-03 reference User and permitted as external).
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum Outcome { allowed | denied | failed }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A person (OIDC subject) or a service identity (batch schedules, data feeds,
+-- worker pool). Every action in Veridian is attributed to exactly one User.
+entity User {
+    subject: String
+    display_name: String
+    kind: person | service
+    -- A service identity has a named, responsible person (D-016).
+    owner: User?
+    created_at: Timestamp
+    status: active | suspended | revoked
+    suspended_at: Timestamp when status = suspended
+    revoked_at: Timestamp when status = revoked
+
+    transitions status {
+        active -> suspended
+        suspended -> active
+        active -> revoked
+        suspended -> revoked
+        terminal: revoked
+    }
+
+    grants: RoleGrant with grantee = this
+    active_grants: grants where state = in_force
+
+    invariant ServiceHasOwner {
+        kind = service implies owner != null
+    }
+}
+
+-- A role held over a validity period. Roles and their rights are defined in
+-- configuration (D-016); grants are data, so they are dated and approved.
+entity RoleGrant {
+    grantee: User
+    role_name: String
+    -- Entitlement scope (D-026): absent means all. Information barriers
+    -- between desks are expressed through legal entity and book.
+    legal_entity: String?
+    book: String?
+    valid_from: Timestamp
+    valid_to: Timestamp?
+    requested_by: User
+    requested_at: Timestamp
+    state: requested | in_force | withdrawn | declined
+    granted_by: User when state = in_force | withdrawn
+    granted_at: Timestamp when state = in_force | withdrawn
+    withdrawn_at: Timestamp when state = withdrawn
+    declined_by: User when state = declined
+
+    transitions state {
+        requested -> in_force
+        requested -> declined
+        in_force -> withdrawn
+        terminal: withdrawn, declined
+    }
+}
+
+-- Break-glass (D-026): time-limited emergency use of a role, with a stated
+-- reason, reviewed afterwards by someone else.
+entity EmergencyAccess {
+    user: User
+    role_name: String
+    reason: String
+    started_at: Timestamp
+    expires_at: Timestamp
+    -- Who may review it now (D-051): a peer holding the role's review
+    -- permission first; if nobody reviews within the deadline, the head of the
+    -- function; then the configured on-call rota, which is told again each
+    -- step until someone reviews. The person who used break-glass is never a
+    -- reviewer, at any level.
+    review_level: peer | head_of_function | on_call
+    next_escalation_at: Timestamp
+    status: open | closed | reviewed
+    closed_at: Timestamp when status = closed | reviewed
+    reviewed_by: User when status = reviewed
+    review_findings: String when status = reviewed
+
+    transitions status {
+        open -> closed
+        closed -> reviewed
+        terminal: reviewed
+    }
+}
+
+-- The audit log as a whole: one instance, used for daily checkpoints.
+entity AuditLog {
+    last_checkpoint_at: Timestamp
+}
+
+-- Daily signed checkpoint of the chain, anchored outside Veridian (D-026).
+entity AuditCheckpoint {
+    up_to_sequence: Integer
+    chain_hash: String
+    signature: String
+    anchor_ref: String
+    created_at: Timestamp
+}
+
+-- Append-only, hash-chained record. Every allowed, denied or failed action is
+-- one event; nothing is ever updated or removed.
+entity AuditEvent {
+    sequence: Integer
+    previous_hash: String
+    event_hash: String
+    actor: User
+    action: String
+    target_ref: String
+    outcome: Outcome
+    reason: String?
+    occurred_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Roles whose grants need a second person (four-eyes).
+    privileged_roles: Set<String> = { "data_steward", "model_approver", "access_admin", "auditor" }
+    -- Approvals need an authentication no older than this (D-026).
+    step_up_window: Duration = 5.minutes
+    break_glass_duration: Duration = 4.hours
+    -- The first review level has this long; each escalation step after it
+    -- has break_glass_escalation_step (D-051).
+    break_glass_review_deadline: Duration = 1.day
+    break_glass_escalation_step: Duration = 1.day
+    checkpoint_interval: Duration = 1.day
+}
+
+------------------------------------------------------------
+-- Defaults
+------------------------------------------------------------
+
+default AuditLog audit_log = { last_checkpoint_at: 0 }
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RegisterPerson {
+    when: PersonOnboarded(admin, subject, display_name)
+    requires: permitted(admin, "user.onboard", subject)
+    requires: not exists User{subject: subject}
+    ensures: User.created(
+        subject: subject,
+        display_name: display_name,
+        kind: person,
+        owner: null,
+        created_at: now,
+        status: active
+    )
+}
+
+rule RegisterServiceIdentity {
+    when: ServiceIdentityCreated(admin, subject, display_name, owner)
+    requires: permitted(admin, "user.onboard", subject)
+    requires: owner.kind = person
+    requires: owner.status = active
+    requires: not exists User{subject: subject}
+    ensures: User.created(
+        subject: subject,
+        display_name: display_name,
+        kind: service,
+        owner: owner,
+        created_at: now,
+        status: active
+    )
+}
+
+rule SuspendUser {
+    when: UserSuspended(admin, user)
+    requires: user.status = active
+    requires: admin != user
+    requires: permitted(admin, "user.suspend", user.subject)
+    ensures:
+        user.status = suspended
+        user.suspended_at = now
+}
+
+rule ReinstateUser {
+    when: UserReinstated(admin, user)
+    requires: user.status = suspended
+    requires: admin != user
+    requires: permitted(admin, "user.suspend", user.subject)
+    ensures:
+        user.status = active
+        user.suspended_at = null
+}
+
+rule RevokeUser {
+    when: UserRevoked(admin, user)
+    requires: user.status in {active, suspended}
+    requires: admin != user
+    requires: permitted(admin, "user.revoke", user.subject)
+    ensures:
+        user.status = revoked
+        user.revoked_at = now
+}
+
+rule RequestRoleGrant {
+    when: RoleGrantRequested(requester, grantee, role_name, legal_entity?, book?, valid_from, valid_to?)
+    requires: permitted(requester, "access.request", role_name)
+    requires: grantee.status = active
+    ensures: RoleGrant.created(
+        grantee: grantee,
+        role_name: role_name,
+        legal_entity: legal_entity,
+        book: book,
+        valid_from: valid_from,
+        valid_to: valid_to,
+        requested_by: requester,
+        requested_at: now,
+        state: requested
+    )
+}
+
+-- Separation of duties: nobody grants a role to themselves; privileged roles
+-- need an approver other than the requester.
+rule ApproveRoleGrant {
+    when: RoleGrantApproved(approver, grant)
+    requires: grant.state = requested
+    requires: approver != grant.grantee
+    requires: grant.role_name in config.privileged_roles implies approver != grant.requested_by
+    requires: permitted(approver, "access.approve", grant.role_name)
+    requires: freshly_authenticated(approver, config.step_up_window)
+    ensures:
+        grant.state = in_force
+        grant.granted_by = approver
+        grant.granted_at = now
+}
+
+rule DeclineRoleGrant {
+    when: RoleGrantDeclined(approver, grant)
+    requires: grant.state = requested
+    requires: permitted(approver, "access.approve", grant.role_name)
+    ensures:
+        grant.state = declined
+        grant.declined_by = approver
+}
+
+rule WithdrawRoleGrant {
+    when: RoleGrantWithdrawn(admin, grant)
+    requires: grant.state = in_force
+    requires: permitted(admin, "access.withdraw", grant.role_name)
+    ensures:
+        grant.state = withdrawn
+        grant.withdrawn_at = now
+}
+
+rule InvokeBreakGlass {
+    when: BreakGlassInvoked(user, role_name, reason)
+    requires: user.status = active
+    requires: permitted(user, "breakglass.invoke", role_name)
+    requires: freshly_authenticated(user, config.step_up_window)
+    ensures: EmergencyAccess.created(
+        user: user,
+        role_name: role_name,
+        reason: reason,
+        started_at: now,
+        expires_at: now + config.break_glass_duration,
+        review_level: peer,
+        next_escalation_at: now + config.break_glass_review_deadline,
+        status: open
+    )
+}
+
+rule CloseBreakGlass {
+    when: BreakGlassClosed(user, access)
+    requires: access.status = open
+    requires: access.user = user
+    ensures:
+        access.status = closed
+        access.closed_at = now
+}
+
+rule BreakGlassExpires {
+    when: access: EmergencyAccess.expires_at <= now
+    requires: access.status = open
+    ensures:
+        access.status = closed
+        access.closed_at = now
+}
+
+rule ReviewBreakGlass {
+    when: BreakGlassReviewed(reviewer, access, findings)
+    requires: access.status = closed
+    requires: reviewer != access.user
+    -- The permission of the current level (peer: breakglass.review,
+    -- head_of_function: breakglass.review_head, on_call:
+    -- breakglass.review_oncall); a holder of a higher level's permission may
+    -- also review at a lower one.
+    requires: reviewer_may_review(reviewer, access.review_level, access.role_name)
+    ensures:
+        access.status = reviewed
+        access.reviewed_by = reviewer
+        access.review_findings = findings
+}
+
+-- Each unanswered step moves the review one level up and tells that level;
+-- at the on-call rota it is repeated every step until someone reviews.
+rule BreakGlassReviewOverdue {
+    when: access: EmergencyAccess.next_escalation_at <= now
+    requires: access.status in {open, closed}
+    ensures:
+        access.review_level = next_review_level(access.review_level)
+        access.next_escalation_at = now + config.break_glass_escalation_step
+        BreakGlassReviewEscalated(access: access, level: next_review_level(access.review_level))
+}
+
+-- HR feed (D-026): a leaver is suspended and loses every grant; a mover loses
+-- every grant and re-requests what the new job needs.
+rule HrLeaver {
+    when: HrLeaverNotified(feed, user)
+    requires: permitted(feed, "hr.leaver", user.subject)
+    requires: user.status = active
+    ensures:
+        user.status = suspended
+        user.suspended_at = now
+        for g in user.active_grants:
+            g.state = withdrawn
+            g.withdrawn_at = now
+}
+
+rule HrMover {
+    when: HrMoverNotified(feed, user)
+    requires: permitted(feed, "hr.mover", user.subject)
+    ensures:
+        for g in user.active_grants:
+            g.state = withdrawn
+            g.withdrawn_at = now
+}
+
+rule SignAuditCheckpoint {
+    when: log: AuditLog.last_checkpoint_at + config.checkpoint_interval <= now
+    let last = latest_audit_event()
+    ensures:
+        AuditCheckpoint.created(
+            up_to_sequence: next_sequence(last) - 1,
+            chain_hash: hash_of(last),
+            signature: sign(hash_of(last)),
+            anchor_ref: anchor_externally(hash_of(last)),
+            created_at: now
+        )
+        log.last_checkpoint_at = now
+}
+
+-- Every decision of permitted(...) anywhere in Veridian, allowed or denied,
+-- and every failure of an attempted action, is appended to the chain.
+-- Reads are recorded only for production and regulatory data (D-026).
+rule RecordAudit {
+    when: ActionAttempted(actor, action, target_ref, outcome, reason?)
+    let last = latest_audit_event()
+    ensures: AuditEvent.created(
+        sequence: next_sequence(last),
+        previous_hash: hash_of(last),
+        event_hash: chain_hash(last, actor, action, target_ref, outcome, now),
+        actor: actor,
+        action: action,
+        target_ref: target_ref,
+        outcome: outcome,
+        reason: reason,
+        occurred_at: now
+    )
+}
+
+-- Reading the audit log is itself an audited action.
+rule AuditorReadsLog {
+    when: AuditLogRead(auditor, range_ref)
+    requires: permitted(auditor, "audit.read", range_ref)
+    ensures: ActionAttempted(actor: auditor, action: "audit.read", target_ref: range_ref, outcome: allowed)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant UniqueSubject {
+    for a in Users:
+        for b in Users:
+            a != b implies a.subject != b.subject
+}
+
+invariant AuditSequenceUnique {
+    for a in AuditEvents:
+        for b in AuditEvents:
+            a != b implies a.sequence != b.sequence
+}
+
+invariant NoSelfGrant {
+    for g in RoleGrants:
+        g.state in {in_force, withdrawn} implies g.granted_by != g.grantee
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor AccessAdministrator {
+    identified_by: User where status = active
+}
+
+actor Auditor {
+    identified_by: User where status = active
+}
+
+actor Operator {
+    identified_by: User where status = active and kind = person
+}
+
+actor HrFeed {
+    identified_by: User where status = active and kind = service
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface AccessAdministration {
+    facing admin: AccessAdministrator
+    context grant: RoleGrant
+
+    exposes:
+        grant.grantee.display_name
+        grant.role_name
+        grant.legal_entity
+        grant.book
+        grant.state
+        grant.valid_from
+        grant.valid_to
+
+    provides:
+        PersonOnboarded(admin, subject, display_name)
+        ServiceIdentityCreated(admin, subject, display_name, owner)
+        UserSuspended(admin, user)
+        UserReinstated(admin, user)
+        UserRevoked(admin, user)
+        RoleGrantRequested(admin, grantee, role_name, legal_entity?, book?, valid_from, valid_to?)
+        RoleGrantApproved(admin, grant) when grant.state = requested
+        RoleGrantDeclined(admin, grant) when grant.state = requested
+        RoleGrantWithdrawn(admin, grant) when grant.state = in_force
+}
+
+surface AuditTrail {
+    facing auditor: Auditor
+    context event: AuditEvent
+
+    exposes:
+        event.sequence
+        event.actor.display_name
+        event.action
+        event.target_ref
+        event.outcome
+        event.reason
+        event.occurred_at
+        event.previous_hash
+        event.event_hash
+
+    provides:
+        AuditLogRead(auditor, range_ref)
+
+    @guarantee TamperEvident
+        -- Recomputing chain_hash over the events in sequence order reproduces
+        -- every event_hash; any edit, insertion or deletion breaks the chain.
+}
+
+surface EmergencyAccessControl {
+    facing operator: Operator
+    context access: EmergencyAccess
+
+    exposes:
+        access.user.display_name
+        access.role_name
+        access.reason
+        access.status
+        access.started_at
+        access.expires_at
+        access.review_level
+
+    provides:
+        BreakGlassInvoked(operator, role_name, reason)
+        BreakGlassClosed(operator, access) when access.status = open
+        BreakGlassReviewed(operator, access, findings) when access.status = closed
+
+    timeout:
+        BreakGlassExpires
+}
+
+surface HumanResourcesFeed {
+    facing feed: HrFeed
+
+    provides:
+        HrLeaverNotified(feed, user)
+        HrMoverNotified(feed, user)
+
+    @guarantee FeedEventsAudited
+        -- Every leaver and mover notification is recorded in the audit chain
+        -- with the users and grants it changed.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- permitted(user, action, target): true only if user.status = active and some
+-- grant in user.active_grants is valid now, its role allows the action
+-- (role_allows, from the configuration release) and its legal entity and book cover the
+-- target. Every evaluation emits ActionAttempted with its outcome.
+-- latest_audit_event, next_sequence, hash_of, chain_hash: black boxes; a
+-- single writer orders the chain.
+-- next_review_level(level): peer -> head_of_function -> on_call -> on_call.
+-- reviewer_may_review(reviewer, level, role_name): permitted(reviewer, the
+--   level's review action, role_name), or the action of a higher level.
+--   The on-call rota is the configured one (D-039).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-026): legal-entity and book scoping; break-glass with
+-- next-day review; reads audited for production and regulatory data only;
+-- step-up authentication for approvals; daily signed, externally anchored
+-- checkpoints; HR feed for leavers and movers.
+-- Resolved (D-042): the bank's legal entity and finance master is
+-- authoritative, ingested as bitemporal reference data (16); a grant on a
+-- legal entity or desk covers its books as of the access check.
+-- Resolved (D-051): break-glass review escalates by role, peer then head of
+-- function then the on-call rota, one step per day (configuration), and the
+-- user of break-glass is never a reviewer.

@@ -1,0 +1,160 @@
+-- allium: 3
+-- 18-equity-option-pricing.allium
+
+-- Scope: Valuation of single-underlying equity call options, European and
+--   American, on a stock paying discrete cash dividends and a dividend yield
+--   (D-022, D-046).
+-- Includes: what a valuation needs, what it must return, how the volatility
+--   and dividends are read from their market objects, how exercise styles
+--   relate, life-cycle events, how the planner expands an option request.
+-- Excludes:
+--   - The trade payload fields: generated from the Julia types (D-018).
+--   - Discount curves, the equity volatility surface and the dividend
+--     schedule themselves (08).
+--   - Sensitivities (vega, curvature) and FRTB aggregation (11): bumped graph
+--     nodes (D-032).
+--   - Puts, barriers, baskets, quantos, index options, local volatility
+--     (see PlainVanillaOnly).
+-- Dependencies: 01, 02, 03, 08.
+--
+-- Planning (D-020), one pass, for one option position version:
+--   calendars named by the trade (03) -> discount curve of the option
+--   currency (08) -> dividend schedule of the underlying (08) -> equity
+--   volatility surface of the underlying (08) -> valuation node (this spec),
+--   with the spot price series of the underlying as input.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract EquityOptionValuation {
+    value: (position: data/InputVersion, as_of: Timestamp, discount_curve: String, vol_surface: String, dividends: String, spot: data/InputVersion, calendars: Set<data/InputVersion>, reporting_currencies: Set<String>, fx: Set<String>) -> String
+
+    @invariant EuropeanClosedForm
+        -- A European call is valued by the Black-Scholes-Merton formula
+        -- with the dividend treatment below.
+
+    @invariant AmericanByLattice
+        -- An American call is valued on a Leisen-Reimer binomial lattice
+        -- (D-046), built on the spot reduced by the present value of the
+        -- forecast cash dividends (OneDividendTreatment), with early
+        -- exercise tested at every step; the number of steps is fixed by the
+        -- recipe, never
+        -- adaptive; evaluation is single-threaded and reproducible (02,
+        -- DeterministicComputation).
+
+    @invariant OneDividendTreatment
+        -- Both exercise styles read the same dividend schedule (08: forecast
+        -- cash amounts near term, a yield further out) and the same
+        -- treatment, so that their values are comparable. The treatment is
+        -- escrowed dividends (D-054): the spot is reduced by the present
+        -- value of the cash dividends to the option's expiry before pricing,
+        -- exactly for the closed form and as the lattice's starting spot for
+        -- the American style; the treatment is named in the recipe and the
+        -- result.
+
+    @invariant VolatilityFromSurface
+        -- The volatility is the surface's implied volatility at the option's
+        -- strike and expiry (08), one value for the whole life of the option;
+        -- no local or stochastic volatility in v1. The surface point used is
+        -- part of the result.
+
+    @invariant AmericanNotBelowEuropean
+        -- For the same terms, the American value is never below the European
+        -- value, and without dividends they are equal within the lattice
+        -- tolerance (early exercise of a call on a non-dividend payer is
+        -- never optimal). A violation is a deterministic rejection naming
+        -- the figures.
+
+    @invariant SeasonedOptionsAreOpenOnly
+        -- An option at or after expiry at as_of is a deterministic rejection
+        -- saying it expired (the position should have been closed by a
+        -- succession, D-023); an exercised option is a succession into the
+        -- delivered position.
+
+    @invariant LifeCycleThroughSuccession
+        -- Exercise, partial close-out (quantity reduction), expiry and
+        -- amendment arrive as successions of the position (D-023); the
+        -- valuation always uses the position version effective at as_of.
+        -- Corporate actions (split, special dividend, merger, delisting): a
+        -- feed proposes them, and each proposal becomes a succession of the
+        -- affected option positions only after a person has reviewed and
+        -- confirmed it (D-054); an unconfirmed proposal changes nothing and
+        -- is listed until decided. The feed's source is an open question.
+
+    @invariant ContractTerms
+        -- The contract multiplier is part of the option security's terms and
+        -- shared by every holder; a position holds only its quantity of
+        -- contracts (D-054).
+
+    @invariant ResultShape
+        -- The valuation result contains (D-046): PV in local currency (the
+        -- option currency) and in each requested reporting currency with the
+        -- FX object used (D-033); intrinsic value and time value; the inputs
+        -- actually used, so a reviewer can reproduce the figure: spot, strike,
+        -- expiry as exact year fraction, discount factor, the volatility and
+        -- its surface point, the dividend schedule and treatment, the
+        -- exercise style and the lattice recipe hash and steps; quantity and
+        -- contract multiplier.
+
+    @invariant InformationalGreeks
+        -- Delta, gamma and vega are reported for desks and are informational:
+        -- regulatory sensitivities always come from the prescribed shocked
+        -- graph nodes (D-032) and never from these figures.
+
+    @invariant PlainVanillaOnly
+        -- v1 (D-046): call options on one stock, in the stock's currency,
+        -- physically settled, single exercise style per trade, fixed strike
+        -- and expiry. Other terms are a deterministic rejection naming the
+        -- feature.
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor PricingWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface EquityOptionValuationComputation {
+    facing worker: PricingWorker
+
+    contracts:
+        demands EquityOptionValuation
+        demands graph/DeterministicComputation
+
+    @guarantee GoldenCrossCheck
+        -- Golden European and American valuations, with and without
+        -- dividends, are reproduced independently (QuantLib, D-010) within a
+        -- stated tolerance before a model version can enter a production
+        -- release.
+
+    @guarantee UpstreamContribution
+        -- The Leisen-Reimer lattice, discrete-dividend handling and the
+        -- Black-Scholes-Merton routines are generic and live in a separate
+        -- package free of Veridian dependencies, offered to JuliaActuary
+        -- first (D-031).
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-046): Black-Scholes-Merton for European, Leisen-Reimer lattice
+-- for American; one volatility per option read from the surface; result
+-- shape as above; informational Greeks.
+-- Resolved (D-054): escrowed dividends for both styles; the default risk
+-- charge of an option position takes the delta-adjusted notional of the
+-- underlying (spec 11); multiplier on the security and quantity on the
+-- position; corporate actions come from a feed and are applied only after a
+-- person's review and confirmation.
+open question "Source of the corporate actions feed under the rule of no paid data subscriptions: a free source, the clearing house notices, or manual entry that the feed later replaces?"
+open question "Under the escrowed treatment an American call has no early-exercise premium from dividends: in the golden vectors (spot 100, strike 95, cash dividends of 1.0 at three and nine months) the escrowed American lattice gives 12.662285 and the European 12.662286, while a spot-dividend finite-difference cross-check gives 12.803288, 0.14 or about 1.1 % higher. Is that difference acceptable for the books, or should the American style use the spot-dividend treatment while the European keeps the closed form? The model validation (21) decides with these figures."

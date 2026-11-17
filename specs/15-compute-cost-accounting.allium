@@ -1,0 +1,386 @@
+-- allium: 3
+-- 15-compute-cost-accounting.allium
+
+-- Scope: Tracking what calculation costs, by whom it was caused, in the way
+--   management accounting tracks costs of a service department (D-040).
+-- Includes: measured resource usage per computation, host capacity cost per
+--   allocation, standard cost rates from configuration, cost centres,
+--   allocation of shared (memoized) results, idle capacity, avoided cost,
+--   costing periods and their close, statements, budgets and alerts.
+-- Excludes:
+--   - Posting to the general ledger (chargeback): v1 is showback; a ledger
+--     export can be added later.
+--   - Staff, licence and data costs: only compute and storage.
+-- Dependencies: 01, 02, 05, 07, 12, 13 (budget alerts).
+--
+-- Method (D-040):
+--   - Standard costing. Rates per resource unit (CPU-second, GB-second of
+--     memory, GB-day of storage per tier) are configuration artefacts with an
+--     effective period. Measured usage x rate = absorbed cost.
+--   - Actual cost is what the grid (or later the cloud bill) charges for host
+--     allocations. Actual minus absorbed = capacity variance, reported
+--     separately and charged to the platform, not to desks: idle capacity is
+--     not a cost of any product.
+--   - Cost object: the calculation request. Each request belongs to one cost
+--     centre (desk, book or platform), from configuration: batch schedules
+--     name theirs; desk views and what-if go to the trader's desk;
+--     rematerialisation goes to whoever needed the purged result;
+--     development requests go to a project code.
+--   - Shared nodes (activity-based): a node's cost is split equally among the
+--     distinct requests that bound to it during the costing period in which
+--     it was computed. Later memo hits cost nothing and are reported as
+--     avoided cost (the node's standard cost), showing what memoization saves.
+--   - Retries after infrastructure failures (crash, host lost, timeout) are
+--     platform cost; deterministic rejections (bad input) are the requester's.
+--   - Measurement is by the supervisor at operating-system level, never
+--     self-reported by the Julia process.
+--   - Money in the group reporting currency, 4 decimals, half-even (D-004).
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./07-julia-workers.allium" as workers
+use "./12-web-front-end-and-batch-console.allium" as web
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Standard rates for one period, registered when a release activates.
+entity CostRateCard {
+    definition_hash: String
+    release: cfg/ConfigurationRelease
+    effective_from: Timestamp
+    effective_to: Timestamp?
+    currency: String
+    rates_hash: String
+}
+
+-- What one attempt at a node consumed, measured by the host supervisor.
+entity ResourceUsage {
+    ticket: workers/JobTicket
+    node: graph/CalculationNode
+    host: workers/ComputeHost
+    measured_by: data/User
+    cpu_seconds: Decimal
+    wall_seconds: Decimal
+    peak_memory_mb: Integer
+    outcome: succeeded | rejected | crashed
+    measured_at: Timestamp
+}
+
+-- Host time paid for: one record per host when it leaves, from its
+-- allocation (grid) or its configured cost (static host).
+entity CapacityRecord {
+    host: workers/ComputeHost
+    host_seconds: Decimal
+    actual_cost: Decimal
+    recorded_at: Timestamp
+}
+
+-- A month (configurable) of costs. Closed by a finance controller other than
+-- the person who prepared it; never reopened, later corrections are
+-- adjustments in the next open period.
+entity CostingPeriod {
+    label: String
+    starts_at: Timestamp
+    ends_at: Timestamp
+    prepared_by: data/User?
+    closed_by: data/User?
+    closed_at: Timestamp?
+    period_state: accruing | prepared | closed_out
+
+    transitions period_state {
+        accruing -> prepared
+        prepared -> accruing
+        prepared -> closed_out
+        terminal: closed_out
+    }
+}
+
+-- One line of the period's result: cost charged to a cost centre for a
+-- category (absorbed compute, absorbed storage, capacity variance,
+-- adjustment) and, for information, avoided cost.
+entity CostLine {
+    period: CostingPeriod
+    cost_centre: String
+    category: absorbed_compute | absorbed_storage | capacity_variance | adjustment | avoided
+    origin_ref: String
+    amount: Decimal
+    currency: String
+}
+
+-- Budget per cost centre and period, from configuration.
+entity CostBudget {
+    period: CostingPeriod
+    cost_centre: String
+    amount: Decimal
+    warned: Boolean
+    exceeded: Boolean
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    budget_warning_ratio: Decimal = 0.8
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RegisterReleaseRateCards {
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for d in release_rate_cards(release):
+            RateCardDefined(release: release, definition: d)
+}
+
+rule CreateRateCard {
+    when: RateCardDefined(release, definition)
+    requires: not exists CostRateCard{definition_hash: rate_card_hash(definition)}
+    ensures: CostRateCard.created(
+        definition_hash: rate_card_hash(definition),
+        release: release,
+        effective_from: rate_card_from(definition),
+        effective_to: rate_card_to(definition),
+        currency: rate_card_currency(definition),
+        rates_hash: rate_card_rates_hash(definition)
+    )
+}
+
+-- The host supervisor measures each finished attempt (07).
+rule RecordUsage {
+    when: UsageMeasured(supervisor, ticket, cpu_seconds, wall_seconds, peak_memory_mb, outcome)
+    requires: data/permitted(supervisor, "cost.measure", ticket.worker.host.node_name)
+    requires: not exists ResourceUsage{ticket: ticket, outcome: outcome}
+    ensures: ResourceUsage.created(
+        ticket: ticket,
+        node: ticket.node,
+        host: ticket.worker.host,
+        measured_by: supervisor,
+        cpu_seconds: cpu_seconds,
+        wall_seconds: wall_seconds,
+        peak_memory_mb: peak_memory_mb,
+        outcome: outcome,
+        measured_at: now
+    )
+}
+
+rule RecordCapacity {
+    when: host: workers/ComputeHost.presence becomes gone
+    ensures: CapacityRecord.created(
+        host: host,
+        host_seconds: host_seconds_of(host),
+        actual_cost: actual_cost_of(host),
+        recorded_at: now
+    )
+}
+
+-- The first period is opened once, when cost accounting starts.
+rule StartCosting {
+    when: CostingStarted(controller, label, starts_at, ends_at)
+    requires: data/permitted(controller, "cost.close", label)
+    requires: not exists CostingPeriod{period_state: accruing}
+    requires: not exists CostingPeriod{period_state: prepared}
+    ensures: CostingPeriod.created(
+        label: label,
+        starts_at: starts_at,
+        ends_at: ends_at,
+        period_state: accruing
+    )
+}
+
+rule OpenNextPeriod {
+    when: period: CostingPeriod.ends_at <= now
+    requires: not exists CostingPeriod{starts_at: period.ends_at}
+    ensures: CostingPeriod.created(
+        label: period_label(period.ends_at),
+        starts_at: period.ends_at,
+        ends_at: next_period_end(period.ends_at),
+        period_state: accruing
+    )
+}
+
+-- Preparing the period computes its cost lines (deterministic: same usage,
+-- capacity, rates and bindings give the same lines).
+rule PreparePeriod {
+    when: PeriodPreparationRequested(controller, period)
+    requires: period.period_state = accruing
+    requires: period.ends_at <= now
+    requires: data/permitted(controller, "cost.prepare", period.label)
+    ensures:
+        period.period_state = prepared
+        period.prepared_by = controller
+        for line in period_cost_lines(period):
+            CostLineComputed(period: period, line: line)
+}
+
+rule RecordCostLine {
+    when: CostLineComputed(period, line)
+    ensures: CostLine.created(
+        period: period,
+        cost_centre: line_cost_centre(line),
+        category: line_category(line),
+        origin_ref: line_origin(line),
+        amount: line_amount(line),
+        currency: line_currency(line)
+    )
+}
+
+-- Sent back for corrections: its lines are recomputed on the next
+-- preparation.
+rule ReturnPeriod {
+    when: PeriodReturned(controller, period, reason)
+    requires: period.period_state = prepared
+    requires: data/permitted(controller, "cost.close", period.label)
+    ensures:
+        period.period_state = accruing
+        period.prepared_by = null
+}
+
+rule ClosePeriod {
+    when: PeriodClosed(controller, period)
+    requires: period.period_state = prepared
+    requires: data/permitted(controller, "cost.close", period.label)
+    requires: data/freshly_authenticated(controller)
+    requires: controller != period.prepared_by
+    ensures:
+        period.period_state = closed_out
+        period.closed_by = controller
+        period.closed_at = now
+        CostStatementsIssued(period: period)
+}
+
+rule RegisterBudget {
+    when: BudgetDefined(period, cost_centre, amount)
+    requires: not exists CostBudget{period: period, cost_centre: cost_centre}
+    ensures: CostBudget.created(
+        period: period,
+        cost_centre: cost_centre,
+        amount: amount,
+        warned: false,
+        exceeded: false
+    )
+}
+
+-- Running spend (absorbed cost so far in the period) is checked as usage
+-- arrives; warnings go through the alerting of spec 13.
+rule CheckBudget {
+    when: usage: ResourceUsage.created
+    ensures:
+        for b in CostBudgets where period.period_state = accruing:
+            if b.cost_centre = cost_centre_of_node(usage.node):
+                if not b.warned and spend_to_date(b) >= b.amount * config.budget_warning_ratio:
+                    b.warned = true
+                    BudgetWarning(budget: b)
+                if not b.exceeded and spend_to_date(b) >= b.amount:
+                    b.exceeded = true
+                    BudgetExceeded(budget: b)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Every unit of absorbed cost lands on exactly one cost centre: the lines of
+-- a closed period add up to the absorbed total plus the capacity variance.
+invariant PeriodBalances {
+    for p in CostingPeriods:
+        p.period_state = closed_out implies period_balances(p)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor FinanceController {
+    identified_by: data/User
+}
+
+actor CostCentreOwner {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface UsageMetering {
+    facing supervisor: workers/WorkerSupervisor
+
+    provides:
+        UsageMeasured(supervisor, ticket, cpu_seconds, wall_seconds, peak_memory_mb, outcome)
+}
+
+surface CostClose {
+    facing controller: FinanceController
+    context period: CostingPeriod
+
+    exposes:
+        period.label
+        period.period_state
+        period.prepared_by
+        period_totals(period)
+        capacity_variance(period)
+
+    provides:
+        CostingStarted(controller, label, starts_at, ends_at)
+        PeriodPreparationRequested(controller, period) when period.period_state = accruing
+        PeriodReturned(controller, period, reason) when period.period_state = prepared
+        PeriodClosed(controller, period) when period.period_state = prepared
+        BudgetDefined(period, cost_centre, amount) when period.period_state = accruing
+        web/ExportRequested(controller, view_ref, format)
+
+    contracts:
+        demands web/WebFrontEnd
+}
+
+-- What a desk head or schedule owner sees: cost by schedule, model, request
+-- kind and month, unit cost (e.g. per position per run), avoided cost from
+-- memoization, budget use, and trends.
+surface CostCentreStatement {
+    facing owner: CostCentreOwner
+    context budget: CostBudget
+
+    exposes:
+        budget.cost_centre
+        budget.period.label
+        budget.amount
+        spend_to_date(budget)
+        cost_breakdown(budget.cost_centre, budget.period)
+        avoided_cost(budget.cost_centre, budget.period)
+        unit_costs(budget.cost_centre, budget.period)
+        cost_trend(budget.cost_centre)
+
+    provides:
+        web/ExportRequested(owner, view_ref, format)
+
+    contracts:
+        demands web/WebFrontEnd
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- release_rate_cards, rate_card_*: from release artefacts (05).
+-- host_seconds_of(host): joined_at to left_at; actual_cost_of(host): grid
+--   or cloud charge for the allocation, or the static host's configured cost.
+-- period_cost_lines(period): the method in the header, applied to the
+--   period's ResourceUsage, CapacityRecords, storage tier history (02),
+--   bindings of steps to nodes, and the rate card effective for each usage.
+-- cost_centre_of_node, spend_to_date, period_balances, period_label,
+--   next_period_end, period_totals, capacity_variance, cost_breakdown,
+--   avoided_cost, unit_costs, cost_trend: queries over the above.
+-- BudgetWarning and BudgetExceeded are raised as alerts (13).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-040 accepted): shared results split equally among the
+-- requests that used them in their period; idle capacity reported as a
+-- platform capacity variance; showback only in v1; calendar-month periods.

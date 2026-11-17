@@ -1,0 +1,552 @@
+-- allium: 3
+-- 19-regulatory-reports.allium
+
+-- Scope: Turning signed-off reported figures into the regulator's report
+--   files, and following each report until the regulator has answered
+--   (D-047).
+-- Includes: report templates from configuration, generation and validation
+--   of report files, release after sign-off, export, recording of the
+--   submission and of the regulator's answer, deadlines, new versions after a
+--   restatement with a per-cell difference list.
+-- Excludes:
+--   - The figures themselves (11) and their sign-off (13): reused as is.
+--   - Transmission to a regulator: a person submits the exported file through
+--     the regulator's own channel; Veridian holds no regulator credentials
+--     and makes no external call (D-047).
+--   - The concrete template layouts of each regulator: configuration
+--     artefacts (05), transcribed from the regulator's publication.
+-- Dependencies: 01, 02, 03, 05, 06, 11, 13.
+--
+-- Principles (D-047):
+--   - A report is a pure function of the reported figures of one publication
+--     and one template definition. Nothing is typed in and nothing is
+--     recomputed: every cell comes from a ReportedFigure (13), so a report
+--     can be rebuilt years later from retained figures and the retained
+--     template and must give the same file hash.
+--   - The engine is template-agnostic. v1's worked example is the EBA COREP
+--     market-risk templates for the simplified standardised approach, C 18.01
+--     to C 23.01 (D-052; public taxonomy); PRA, HKMA and US federal
+--     templates are added as configuration without changing this spec.
+--     Identifiers and cell references are transcribed verbatim from the
+--     regulator's publication (extracted in docs/regulatory/
+--     eba-corep-market-risk/); the validation rules and the file format
+--     remain to be transcribed before the first template is released.
+--   - Generation is a calculation node (02): its calc_id covers the template
+--     hash and the hashes of the figures it reads.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./11-frtb-sa.allium" as frtb
+use "./12-web-front-end-and-batch-console.allium" as web
+use "./13-report-review-alerts-trends.allium" as review
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract ReportGeneration {
+    generate: (publication_figures: Set<String>, template_hash: String, previous_report_hash: String?) -> String
+    validate: (report_hash: String, template_hash: String) -> String
+
+    @invariant CellsFromReportedFigures
+        -- Every cell value is a reported figure of the publication (13), or a
+        -- sum or other arithmetic of reported figures that the template
+        -- states. A cell the figures cannot supply is a deterministic
+        -- rejection naming the cell; it is never left blank or filled by hand.
+
+    @invariant PrescribedRoundingAtTheEdge
+        -- Figures are kept at full precision (13). Rounding to the template's
+        -- reporting unit (for example thousands) and its sign convention
+        -- happen only here, when the file is produced, exactly as the
+        -- regulator prescribes (F-3), and are separate from the canonical
+        -- rounding used for hashing (D-015). Totals in the template are
+        -- computed from the rounded cells when the regulator's rules require
+        -- it, and the template says which.
+
+    @invariant TemplateCurrency
+        -- A template names the currency its amounts are reported in. A
+        -- perimeter whose reporting currency differs is a deterministic
+        -- rejection; there is no conversion at this stage (11, ReportingCurrency).
+
+    @invariant RegulatorRulesBlockRelease
+        -- The regulator's own validation rules, carried in the template, are
+        -- evaluated on the finished file. A rule that fails keeps the report
+        -- from release and is listed with the cells involved; a rule the
+        -- regulator marks as a warning is listed and does not block.
+
+    @invariant ReproducibleFromRetainedData
+        -- Given the same retained figures and the same template definition,
+        -- the file is byte-identical and its hash matches the recorded one.
+        -- Template definitions are kept as long as the reports built from
+        -- them (same retention class as reported figures, 13).
+
+    @invariant DataClassSeparation
+        -- A report built from synthetic, test or what-if data is generated
+        -- for review but carries its data class in its content and can never
+        -- be exported as a regulatory report or recorded as submitted
+        -- (D-010).
+
+    @invariant NewVersionCarriesDifferences
+        -- A report that restates an earlier one carries, cell by cell, the
+        -- earlier and the new value, and lists cells that appear or
+        -- disappear. Unchanged cells are not listed.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A regulator's template as the bank uses it, from a configuration release.
+-- definition_hash covers the template's cell mapping, rounding and sign
+-- rules, validation rules and taxonomy version.
+entity ReportTemplate {
+    regulator: String
+    template_code: String
+    taxonomy_version: String
+    file_format: xbrl_csv | csv | spreadsheet
+    reporting_currency: String
+    -- The filing deadline as a number of business days after the reference
+    -- date, on the regulator's calendar (03).
+    deadline_business_days: Integer
+    deadline_calendar: String
+    release: cfg/ConfigurationRelease
+    definition_hash: String
+}
+
+-- One generated report: one template, one perimeter, one publication.
+entity RegulatoryReport {
+    publication: batch/RunPublication
+    template: ReportTemplate
+    perimeter: frtb/ReportingPerimeter
+    version: Integer
+    supersedes: RegulatoryReport?
+    file_hash: String
+    file_ref: String
+    data_class: data/DataClass
+    generated_at: Timestamp
+    due_at: Timestamp
+    state: generated | failed_validation | validated | released | submitted | accepted | refused | superseded
+
+    transitions state {
+        generated -> validated
+        generated -> failed_validation
+        validated -> released
+        released -> submitted
+        submitted -> accepted
+        submitted -> refused
+        accepted -> superseded
+        refused -> superseded
+        released -> superseded
+        terminal: failed_validation, superseded
+    }
+}
+
+-- A validation rule that failed, with the cells it involves.
+entity ValidationFinding {
+    report: RegulatoryReport
+    rule_ref: String
+    blocking: Boolean
+    cells: String
+    description: String
+}
+
+-- One cell that differs between a report and the one it supersedes.
+entity CellDifference {
+    report: RegulatoryReport
+    cell_ref: String
+    previous_value: Decimal?
+    new_value: Decimal?
+}
+
+-- A person's export of a released report: who took the file and when.
+entity ReportExport {
+    report: RegulatoryReport
+    exported_by: data/User
+    exported_at: Timestamp
+    file_hash: String
+}
+
+-- The submission made by a person through the regulator's channel.
+entity Submission {
+    report: RegulatoryReport
+    submitted_by: data/User
+    submitted_at: Timestamp
+    receipt_ref: String
+    outcome: pending | accepted | refused
+    outcome_at: Timestamp?
+    outcome_reason: String?
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How long before a deadline an unsubmitted report is brought to its
+    -- owner's attention.
+    deadline_warning: Duration = 1.days
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Templates come only from configuration releases, like schedules (06) and
+-- perimeters (11).
+rule RegisterReleaseTemplates {
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for d in release_templates(release):
+            TemplateDefined(release: release, definition: d)
+}
+
+rule CreateTemplate {
+    when: TemplateDefined(release, definition)
+    requires: not exists ReportTemplate{definition_hash: template_definition_hash(definition)}
+    ensures: ReportTemplate.created(
+        regulator: template_regulator(definition),
+        template_code: template_code_of(definition),
+        taxonomy_version: template_taxonomy(definition),
+        file_format: template_format(definition),
+        reporting_currency: template_currency(definition),
+        deadline_business_days: template_deadline_days(definition),
+        deadline_calendar: template_deadline_calendar(definition),
+        release: release,
+        definition_hash: template_definition_hash(definition)
+    )
+}
+
+-- Every publication of a regulatory schedule gets its reports before sign-off,
+-- so the signers see the files they release. A restatement's reports link to
+-- the reports of the publication they replace and carry the differences.
+rule GenerateReports {
+    when: publication: batch/RunPublication.created
+    requires: review/is_regulatory(publication.run.schedule)
+    ensures:
+        for t in templates_applying(publication.run.schedule, publication.run.as_of):
+            ReportGenerated(
+                publication: publication,
+                template: t,
+                perimeter: perimeter_of(publication.run.schedule, t),
+                previous: report_replaced_by(publication, t)
+            )
+}
+
+rule CreateReport {
+    when: ReportGenerated(publication, template, perimeter, previous)
+    requires: template.reporting_currency = perimeter.reporting_currency
+    ensures: RegulatoryReport.created(
+        publication: publication,
+        template: template,
+        perimeter: perimeter,
+        version: if previous != null: previous.version + 1 else: 1,
+        supersedes: previous,
+        file_hash: report_file_hash(publication, template),
+        file_ref: report_file_ref(publication, template),
+        data_class: publication.run.schedule.data_class,
+        generated_at: now,
+        due_at: report_due_at(template, publication.run.as_of),
+        state: generated
+    )
+}
+
+-- A template whose currency differs from the perimeter's is rejected visibly,
+-- never skipped.
+rule RejectTemplateCurrencyMismatch {
+    when: ReportGenerated(publication, template, perimeter, previous)
+    requires: template.reporting_currency != perimeter.reporting_currency
+    ensures: review/Alert.created(
+        source: run_problem,
+        subject_ref: template.template_code,
+        description: "template currency differs from the perimeter's reporting currency",
+        raised_at: now,
+        owner: publication.run.schedule.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule ListDifferences {
+    when: report: RegulatoryReport.created
+    requires: report.supersedes != null
+    ensures:
+        for d in cell_differences(report, report.supersedes):
+            CellDifference.created(
+                report: report,
+                cell_ref: difference_cell(d),
+                previous_value: difference_previous(d),
+                new_value: difference_new(d)
+            )
+}
+
+rule ValidateReport {
+    when: report: RegulatoryReport.created
+    ensures:
+        for f in validation_findings(report):
+            ValidationFinding.created(
+                report: report,
+                rule_ref: finding_rule(f),
+                blocking: finding_blocking(f),
+                cells: finding_cells(f),
+                description: finding_description(f)
+            )
+        if has_blocking_findings(report):
+            report.state = failed_validation
+            review/Alert.created(
+                source: run_problem,
+                subject_ref: report.template.template_code,
+                description: "regulatory report failed the regulator's validation rules",
+                raised_at: now,
+                owner: report.publication.run.schedule.owner,
+                escalated: false,
+                alert_state: raised
+            )
+        else:
+            report.state = validated
+}
+
+-- Release follows the sign-off of the publication (13); a report that failed
+-- validation is never released.
+rule ReleaseReports {
+    when: review/ReportReleased(signoff)
+    ensures:
+        for r in reports_of(signoff.publication):
+            if r.state = validated and r.data_class = production:
+                r.state = released
+                if r.supersedes != null:
+                    ReportSuperseding(previous: r.supersedes)
+}
+
+rule SupersedePrevious {
+    when: ReportSuperseding(previous)
+    requires: previous.state in {released, accepted, refused}
+    ensures: previous.state = superseded
+}
+
+rule ExportReport {
+    when: ReportExportRequested(user, report)
+    requires: report.state in {released, submitted, accepted, refused}
+    requires: data/permitted(user, "report.export", report.template.template_code)
+    requires: data/freshly_authenticated(user)
+    ensures: ReportExport.created(
+        report: report,
+        exported_by: user,
+        exported_at: now,
+        file_hash: report.file_hash
+    )
+}
+
+-- The submission is recorded by the person who made it, against a report they
+-- exported. The receipt reference is the regulator's own.
+rule RecordSubmission {
+    when: SubmissionRecorded(user, report, receipt_ref)
+    requires: report.state = released
+    requires: exists ReportExport{report: report, exported_by: user}
+    requires: data/permitted(user, "report.submit", report.template.template_code)
+    requires: data/freshly_authenticated(user)
+    ensures:
+        report.state = submitted
+        Submission.created(
+            report: report,
+            submitted_by: user,
+            submitted_at: now,
+            receipt_ref: receipt_ref,
+            outcome: pending
+        )
+}
+
+rule RecordAcceptance {
+    when: RegulatorAccepted(user, submission)
+    requires: submission.outcome = pending
+    requires: data/permitted(user, "report.submit", submission.report.template.template_code)
+    ensures:
+        submission.outcome = accepted
+        submission.outcome_at = now
+        submission.report.state = accepted
+}
+
+-- A refusal is an alert and needs a corrected version: the regulator's reason
+-- is kept, and the owner decides on a restatement (06).
+rule RecordRefusal {
+    when: RegulatorRefused(user, submission, reason)
+    requires: submission.outcome = pending
+    requires: data/permitted(user, "report.submit", submission.report.template.template_code)
+    ensures:
+        submission.outcome = refused
+        submission.outcome_at = now
+        submission.outcome_reason = reason
+        submission.report.state = refused
+        review/Alert.created(
+            source: run_problem,
+            subject_ref: submission.report.template.template_code,
+            description: "regulator refused the submission",
+            raised_at: now,
+            owner: submission.report.publication.run.schedule.owner,
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule DeadlineApproaching {
+    when: report: RegulatoryReport.due_at - config.deadline_warning <= now
+    requires: report.state in {generated, failed_validation, validated, released}
+    ensures: review/Alert.created(
+        source: run_problem,
+        subject_ref: report.template.template_code,
+        description: "regulatory report not yet submitted near its deadline",
+        raised_at: now,
+        owner: report.publication.run.schedule.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule DeadlineMissed {
+    when: report: RegulatoryReport.due_at <= now
+    requires: report.state in {generated, failed_validation, validated, released}
+    ensures: review/Alert.created(
+        source: run_problem,
+        subject_ref: report.template.template_code,
+        description: "regulatory report deadline missed",
+        raised_at: now,
+        owner: report.publication.run.schedule.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant OnlyProductionIsSubmitted {
+    for r in RegulatoryReports:
+        r.state in {released, submitted, accepted, refused} implies r.data_class = production
+}
+
+invariant NoReleaseWithoutSignOff {
+    for r in RegulatoryReports:
+        r.state in {released, submitted, accepted, refused}
+            implies exists review/ReportSignOff{publication: r.publication, signoff: signed_off}
+}
+
+invariant SubmissionNeedsExport {
+    for s in Submissions:
+        exists ReportExport{report: s.report, exported_by: s.submitted_by}
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ReportingOfficer {
+    identified_by: data/User
+}
+
+actor ReportWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface RegulatoryReportHandling {
+    facing officer: ReportingOfficer
+    context report: RegulatoryReport
+
+    exposes:
+        report.template.regulator
+        report.template.template_code
+        report.template.taxonomy_version
+        report.perimeter.name
+        report.publication.run.as_of
+        report.version
+        report.supersedes
+        report.state
+        report.due_at
+        report.file_hash
+        findings_of(report)
+        differences_of(report)
+        submission_of(report)
+
+    provides:
+        ReportExportRequested(officer, report) when report.state in {released, submitted, accepted, refused}
+        SubmissionRecorded(officer, report, receipt_ref) when report.state = released
+        RegulatorAccepted(officer, submission) when submission_of(report).outcome = pending
+        RegulatorRefused(officer, submission, reason) when submission_of(report).outcome = pending
+
+    contracts:
+        demands web/WebFrontEnd
+}
+
+surface ReportGenerationComputation {
+    facing worker: ReportWorker
+
+    contracts:
+        demands ReportGeneration
+        demands graph/DeterministicComputation
+
+    @guarantee GoldenFiles
+        -- Golden reports (frozen figures, template and the expected file) are
+        -- reproduced byte for byte before a template can enter a production
+        -- release (F-1).
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- release_templates, template_* accessors: from the release artefacts (05).
+-- templates_applying(schedule, as_of): templates of the active release that
+--   apply to the schedule on that date (taxonomy versions have effective
+--   dates, so a date before a taxonomy switch uses the earlier one).
+-- perimeter_of(schedule, template): the perimeter the template reports on.
+-- report_replaced_by(publication, template): the report of the publication
+--   that this one replaces (06), for the same template and perimeter.
+-- report_file_hash, report_file_ref: result of the generation node (02); the
+--   file lives in the object store under the retention class of 13.
+-- report_due_at(template, as_of): deadline_business_days business days after
+--   the reference date on the template's calendar (03).
+-- cell_differences, difference_*: cell-by-cell comparison of two reports.
+-- validation_findings, finding_*, has_blocking_findings: the regulator's
+--   validation rules evaluated on the file.
+-- reports_of(publication), findings_of, differences_of, submission_of:
+--   queries.
+-- Alerts use spec 13's Alert entity directly (source run_problem), owned by the schedule's owner.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-047): template-agnostic engine with the EBA COREP market-risk
+-- templates as the worked example; a person submits the exported file; a
+-- restatement produces a new linked version with a difference list.
+-- Done 2026-11-16: identifiers and cell references of the published EBA
+-- market-risk templates (framework 4.0, C(2024) 8389) are extracted verbatim
+-- in docs/regulatory/eba-corep-market-risk/. They are the simplified
+-- standardised approach (C 18.01 to C 23.01), not the sensitivities-based
+-- method of spec 11.
+-- Resolved (D-052): the worked example is the simplified standardised
+-- approach templates C 18.01 to C 23.01.
+-- Resolved (D-052): the figures of C 18.01, C 21.01 and C 22.01 are produced
+-- by spec 22 (simplified standardised approach). C 19.01, C 20.01 and C 23.01
+-- are not produced in v1 (no v1 instrument attracts them).
+open question "When the EBA publishes the FRTB-based templates (release 4.4 mentions them without codes), they are added as configuration; the engine does not change."
+-- Done 2026-11-17: the 261 EBA validation rules that name the three
+-- templates (4.4 phase 1 workbook) and the filing rules' format sections are
+-- extracted verbatim in docs/regulatory/eba-corep-market-risk/. The validation
+-- rules are carried in the template definition (see the invariant at line
+-- 74, the regulator's own validation rules) as the expressions published,
+-- with their severity and module.
+open question "The taxonomy's own cell identifiers (the DPM 2.0 database) are still to be transcribed; the validation rules address cells by the templates' row and column codes, so generation can proceed without them."
+open question "The EBA filing rules define both xBRL-XML and xBRL-CSV and leave the choice and the file naming to the recipient supervisor. Which does each of the bank's supervisors require? The template's file_format field is set per template and regulator from the answer."
+open question "The validation rules and the taxonomy name the tables C_18.00, C_21.00 and C_22.00, while the annex of C(2024) 8389 names them C 18.01, C 21.01 and C 22.01. Which code goes into template_code and the file? The answer comes from the supervisor's reporting instructions."
+open question "Which regulators and templates does each legal entity report to, and who owns each template's configuration?"
+open question "Filing deadlines and calendars per regulator: configured per template; the bank confirms its own obligations."
+-- Resolved (D-054): a corrected version after a refusal is a restatement
+-- with four-eyes review (06), a new linked version with a per-cell
+-- difference list; the regulator's reason is recorded on the new version.
+open question "Retention of the exported files and submission receipts: same 10 years as reported figures, to be confirmed with compliance."

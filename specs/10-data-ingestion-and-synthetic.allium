@@ -1,0 +1,440 @@
+-- allium: 3
+-- 10-data-ingestion-and-synthetic.allium
+
+-- Scope: How external and synthetic data enter Veridian (D-034, D-035).
+-- Includes: the register of approved data sources and their terms, ingestion
+--   runs by replaceable adapters, validation, expected publication and
+--   staleness, source revisions, attribution, seeded synthetic generation
+--   (market data and portfolios) and golden data sets.
+-- Excludes:
+--   - Versioning of what is ingested: ordinary input versions (01).
+--   - Adapter and generator code: configuration releases (05).
+--   - Payload meaning and validation logic: Julia (D-018).
+-- Dependencies: 01, 02, 05.
+--
+-- Principles:
+--   - Veridian slots into an existing organisation: every external source is
+--     reached through an adapter that only produces input versions, so a bank
+--     replaces free sources with its own feeds without platform change.
+--   - No paid subscriptions in v1; a source is used only after its terms have
+--     been checked and recorded (docs/design/data-sources.md).
+--   - Synthetic data is reproducible: same generator code, parameters and seed
+--     give byte-identical content hashes, and it is never production data.
+
+use "./01-bitemporal-data.allium" as data
+use "./05-configuration-release.allium" as cfg
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A provider and dataset Veridian may ingest, with the terms that allow it.
+-- Internal systems of record (booking, position keeping, entity master) are
+-- sources too (16); their terms are the bank's internal data agreements.
+entity DataSource {
+    name: String
+    provider: String
+    feed: market_data | trades | positions | hierarchy | parties | securities | ratings
+    -- The business owner who answers for the data, e.g. resolves breaks (16).
+    data_owner: data/User
+    terms_url: String
+    terms_checked_at: Timestamp
+    attribution_text: String
+    allows_automated_access: Boolean
+    allows_demonstration: Boolean
+    -- Local time and zone by which a publication is expected, per business day.
+    expected_by: String
+    adapter_identity: data/User
+    registered_by: data/User
+    approval: pending | approved | suspended
+    approved_by: data/User when approval = approved | suspended
+
+    transitions approval {
+        pending -> approved
+        approved -> suspended
+        suspended -> approved
+    }
+
+    usable: approval = approved and allows_automated_access
+}
+
+-- One retrieval by an adapter.
+entity IngestionRun {
+    source: DataSource
+    started_at: Timestamp
+    retrieval_ref: String
+    outcome: fetching | recorded | invalid | unreachable
+    versions_recorded: Integer
+    problem: String when outcome = invalid | unreachable
+
+    transitions outcome {
+        fetching -> recorded
+        fetching -> invalid
+        fetching -> unreachable
+        terminal: recorded, invalid, unreachable
+    }
+}
+
+-- A reproducible synthetic data set: market data, fixings, credit curves,
+-- volatility surfaces, dividends, or portfolios (e.g. 100 000 vanilla IRS for
+-- performance demonstration).
+entity SyntheticDataSet {
+    generator_code_hash: String
+    parameters_hash: String
+    seed: Integer
+    data_class: data/DataClass
+    requested_by: data/User
+    requested_at: Timestamp
+    production: generating | generated | refused
+    versions_recorded: Integer
+    refusal_reason: String when production = refused
+
+    transitions production {
+        generating -> generated
+        generating -> refused
+        terminal: generated, refused
+    }
+
+    invariant NeverProduction {
+        data_class in {synthetic, test, golden}
+    }
+}
+
+-- A golden data set with its expected results, before it may serve as a
+-- regression fixture (F-1, D-051). The content hash covers the inputs and the
+-- expected results together, so a changed set is a new record that needs new
+-- sign-off; nothing is edited in place.
+entity GoldenDataSet {
+    name: String
+    content_hash: String
+    author: data/User
+    data_owner: data/User
+    proposed_at: Timestamp
+    supersedes: GoldenDataSet?
+    validator: data/User? when state = partly_signed | signed_off
+    owner_signed_by: data/User? when state = partly_signed | signed_off
+    state: awaiting_signoff | partly_signed | signed_off | superseded
+
+    transitions state {
+        awaiting_signoff -> partly_signed
+        awaiting_signoff -> signed_off
+        partly_signed -> signed_off
+        awaiting_signoff -> superseded
+        partly_signed -> superseded
+        signed_off -> superseded
+        terminal: superseded
+    }
+
+    invariant SignersAreIndependent {
+        state = signed_off implies
+            validator != author and owner_signed_by != author and validator != owner_signed_by
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RegisterDataSource {
+    when: DataSourceRegistered(steward, name, provider, feed, data_owner, terms_url, attribution_text, allows_automated_access, allows_demonstration, expected_by, adapter_identity)
+    requires: data/permitted(steward, "source.register", name)
+    requires: not exists DataSource{name: name}
+    ensures: DataSource.created(
+        name: name,
+        provider: provider,
+        feed: feed,
+        data_owner: data_owner,
+        terms_url: terms_url,
+        terms_checked_at: now,
+        attribution_text: attribution_text,
+        allows_automated_access: allows_automated_access,
+        allows_demonstration: allows_demonstration,
+        expected_by: expected_by,
+        adapter_identity: adapter_identity,
+        registered_by: steward,
+        approval: pending
+    )
+}
+
+-- Terms are reviewed by someone other than the person who recorded them.
+rule ApproveDataSource {
+    when: DataSourceApproved(approver, source)
+    requires: source.approval in {pending, suspended}
+    requires: approver != source.registered_by
+    requires: data/permitted(approver, "source.approve", source.name)
+    requires: data/freshly_authenticated(approver)
+    ensures:
+        source.approval = approved
+        source.approved_by = approver
+}
+
+-- Golden sets (D-051): two different people sign off, neither the author. The
+-- model validator (21, permission model.validate) confirms the expected
+-- results against the independent reference; the data owner confirms the
+-- inputs. Sign-off is recorded against the content hash.
+rule ProposeGoldenSet {
+    when: GoldenSetProposed(author, name, content_hash, data_owner, supersedes?)
+    requires: data/permitted(author, "golden.propose", name)
+    requires: data_owner != author
+    requires: not exists GoldenDataSet{content_hash: content_hash}
+    ensures: GoldenDataSet.created(
+        name: name,
+        content_hash: content_hash,
+        author: author,
+        data_owner: data_owner,
+        proposed_at: now,
+        supersedes: supersedes,
+        state: awaiting_signoff
+    )
+}
+
+rule SignGoldenAsValidator {
+    when: GoldenSetValidated(validator, set)
+    requires: set.state in {awaiting_signoff, partly_signed}
+    requires: set.validator = null
+    requires: validator != set.author and validator != set.data_owner
+    requires: data/permitted(validator, "model.validate", set.name)
+    requires: data/freshly_authenticated(validator)
+    ensures:
+        set.validator = validator
+        if set.owner_signed_by != null:
+            set.state = signed_off
+        else:
+            set.state = partly_signed
+}
+
+rule SignGoldenAsOwner {
+    when: GoldenSetConfirmed(owner, set)
+    requires: set.state in {awaiting_signoff, partly_signed}
+    requires: set.owner_signed_by = null
+    requires: owner = set.data_owner
+    requires: owner != set.author
+    requires: data/permitted(owner, "golden.confirm_data", set.name)
+    requires: data/freshly_authenticated(owner)
+    ensures:
+        set.owner_signed_by = owner
+        if set.validator != null:
+            set.state = signed_off
+        else:
+            set.state = partly_signed
+}
+
+-- A new version of a golden set replaces the one it names; fixtures always
+-- point at a set in state signed_off.
+rule SupersedeGoldenSet {
+    when: set: GoldenDataSet.state becomes signed_off
+    requires: set.supersedes != null
+    ensures: set.supersedes.state = superseded
+}
+
+-- E.g. the provider changes its terms: ingestion stops until re-approved.
+rule SuspendDataSource {
+    when: DataSourceSuspended(steward, source, reason)
+    requires: source.approval = approved
+    requires: data/permitted(steward, "source.suspend", source.name)
+    ensures: source.approval = suspended
+}
+
+rule StartIngestion {
+    when: IngestionStarted(adapter, source, retrieval_ref)
+    requires: source.usable
+    requires: adapter = source.adapter_identity
+    ensures: IngestionRun.created(
+        source: source,
+        started_at: now,
+        retrieval_ref: retrieval_ref,
+        outcome: fetching,
+        versions_recorded: 0
+    )
+}
+
+-- Each retrieved item is validated by Julia against its schema (D-018)
+-- before it is submitted as an input version carrying lineage_ref.
+rule IngestionRecorded {
+    when: IngestionCompleted(adapter, run, count)
+    requires: run.outcome = fetching
+    requires: adapter = run.source.adapter_identity
+    ensures:
+        run.outcome = recorded
+        run.versions_recorded = count
+}
+
+-- Invalid content is never recorded; a person is told.
+rule IngestionInvalid {
+    when: IngestionRejected(adapter, run, problem)
+    requires: run.outcome = fetching
+    ensures:
+        run.outcome = invalid
+        run.problem = problem
+        DataQualityAlert(source: run.source, problem: problem)
+}
+
+rule IngestionUnreachable {
+    when: IngestionFailed(adapter, run, problem)
+    requires: run.outcome = fetching
+    ensures:
+        run.outcome = unreachable
+        run.problem = problem
+        DataQualityAlert(source: run.source, problem: problem)
+}
+
+-- A publication that has not arrived by its expected time is reported; the
+-- previous value is never silently carried forward.
+rule PublicationOverdue {
+    when: PublicationMissing(monitor, source, business_date)
+    requires: source.approval = approved
+    ensures: DataQualityAlert(source: source, problem: "publication overdue")
+}
+
+rule GenerateSyntheticData {
+    when: SyntheticDataRequested(requester, generator_code_hash, parameters_hash, seed, data_class)
+    requires: data/permitted(requester, "synthetic.generate", data_class)
+    requires: data_class in {synthetic, test, golden}
+    requires: generator_in_active_release(generator_code_hash)
+    ensures: SyntheticDataSet.created(
+        generator_code_hash: generator_code_hash,
+        parameters_hash: parameters_hash,
+        seed: seed,
+        data_class: data_class,
+        requested_by: requester,
+        requested_at: now,
+        production: generating,
+        versions_recorded: 0
+    )
+}
+
+rule SyntheticDataGenerated {
+    when: SyntheticDataCompleted(generator, set, count)
+    requires: set.production = generating
+    ensures:
+        set.production = generated
+        set.versions_recorded = count
+}
+
+rule SyntheticDataRefused {
+    when: SyntheticDataFailed(generator, set, reason)
+    requires: set.production = generating
+    ensures:
+        set.production = refused
+        set.refusal_reason = reason
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor DataSteward {
+    identified_by: data/User
+}
+
+actor SourceAdapter {
+    identified_by: data/User
+}
+
+actor SyntheticGenerator {
+    identified_by: data/User
+}
+
+actor PublicationMonitor {
+    identified_by: data/User
+}
+
+actor GoldenSetReviewer {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface SourceGovernance {
+    facing steward: DataSteward
+    context source: DataSource
+
+    exposes:
+        source.name
+        source.provider
+        source.feed
+        source.data_owner
+        source.terms_url
+        source.terms_checked_at
+        source.attribution_text
+        source.approval
+
+    provides:
+        DataSourceRegistered(steward, name, provider, feed, data_owner, terms_url, attribution_text, allows_automated_access, allows_demonstration, expected_by, adapter_identity)
+        DataSourceApproved(steward, source) when source.approval in {pending, suspended}
+        DataSourceSuspended(steward, source, reason) when source.approval = approved
+        SyntheticDataRequested(steward, generator_code_hash, parameters_hash, seed, data_class)
+
+    @guarantee AttributionTravelsWithResults
+        -- Any screen, report or export showing results derived from a
+        -- public source shows that source's attribution text and notices.
+}
+
+surface Ingestion {
+    facing adapter: SourceAdapter
+    context run: IngestionRun
+
+    provides:
+        IngestionStarted(adapter, source, retrieval_ref)
+        IngestionCompleted(adapter, run, count) when run.outcome = fetching
+        IngestionRejected(adapter, run, problem) when run.outcome = fetching
+        IngestionFailed(adapter, run, problem) when run.outcome = fetching
+}
+
+surface SyntheticProduction {
+    facing generator: SyntheticGenerator
+    context set: SyntheticDataSet where production = generating
+
+    provides:
+        SyntheticDataCompleted(generator, set, count)
+        SyntheticDataFailed(generator, set, reason)
+
+    @guarantee Reproducible
+        -- The same generator code, parameters and seed produce byte-identical
+        -- content hashes on any worker, at any time.
+}
+
+surface GoldenSetSignOff {
+    facing reviewer: GoldenSetReviewer
+    context set: GoldenDataSet
+
+    exposes:
+        set.name
+        set.content_hash
+        set.author
+        set.data_owner
+        set.validator
+        set.owner_signed_by
+        set.state
+
+    provides:
+        GoldenSetProposed(reviewer, name, content_hash, data_owner, supersedes?)
+        GoldenSetValidated(reviewer, set) when set.state in {awaiting_signoff, partly_signed}
+        GoldenSetConfirmed(reviewer, set) when set.state in {awaiting_signoff, partly_signed}
+
+    @guarantee FixturesUseSignedOffSets
+        -- A regression fixture (F-1) names a golden set only in state
+        -- signed_off; a fixture whose set has been superseded fails until it
+        -- points at the new one.
+}
+
+surface PublicationMonitoring {
+    facing monitor: PublicationMonitor
+
+    provides:
+        PublicationMissing(monitor, source, business_date)
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-042): source revisions (e.g. a republished SOFR) are recorded
+-- at once as source corrections (01 RecordSourceCorrection) under the
+-- source's own controls; runs that used the old value are flagged for review
+-- (06).
+-- Resolved (D-051): a golden set is signed off by the model validator and the
+-- data owner, two different people, neither the author.
+open question "Demonstrations to third parties: which sources may appear (allows_demonstration), pending the bank's legal review of each provider's terms?"

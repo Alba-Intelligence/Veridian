@@ -1,0 +1,469 @@
+-- allium: 3
+-- 13-report-review-alerts-trends.allium
+
+-- Scope: What happens to a published batch run before and after it reaches
+--   its consumers (D-038).
+-- Includes: sign-off of publications (four-eyes for regulatory figures),
+--   long-term reported figures, alert rules from configuration, alerts with
+--   acknowledgement and escalation, trends over time (as reported and as
+--   restated), drill-down from a figure to its contributors.
+-- Excludes:
+--   - Formal attribution of day-on-day moves (new and matured trades, market
+--     moves, model changes): later; v1 drills down through the graph.
+--   - Regulatory report file formats and submission: spec 19 (D-047).
+--   - Notification transport (email server, chat): emitted events.
+-- Dependencies: 01, 02, 05, 06, 10, 11, 12.
+--
+-- Retention (D-038): calculation payloads age out after 37 days (D-005), but
+-- reported figures (totals per perimeter, desk, risk class, bucket and
+-- measure) are kept as their own retention class for 10 years, to be
+-- confirmed with compliance. Drill-down into an old figure recomputes purged
+-- payloads, which must reproduce their result hashes (D-005).
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./10-data-ingestion-and-synthetic.allium" as ingest
+use "./12-web-front-end-and-batch-console.allium" as web
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Sign-off of one publication before it is released to regulators or
+-- management. Regulatory publications need two different signers.
+entity ReportSignOff {
+    publication: batch/RunPublication
+    needs_second_signer: Boolean
+    created_at: Timestamp
+    due_at: Timestamp
+    first_signer: data/User?
+    second_signer: data/User?
+    withheld_reason: String?
+    escalated: Boolean
+    signoff: awaiting_signoff | partly_signed | signed_off | withheld
+
+    transitions signoff {
+        awaiting_signoff -> partly_signed
+        awaiting_signoff -> signed_off
+        awaiting_signoff -> withheld
+        partly_signed -> signed_off
+        partly_signed -> withheld
+        terminal: signed_off, withheld
+    }
+}
+
+-- One reported figure, kept long after the calculation payloads are purged.
+-- figure_key names perimeter, desk, risk class, bucket and measure (e.g.
+-- "GROUP/EUR/desk=rates/GIRR/delta/bucket=EUR"); source_calc_id points into
+-- the graph for drill-down.
+entity ReportedFigure {
+    publication: batch/RunPublication
+    figure_key: String
+    as_of: Timestamp
+    value: Decimal
+    currency: String
+    data_class: data/DataClass
+    source_calc_id: String
+    recorded_at: Timestamp
+    retained_until: Timestamp
+}
+
+-- An alert rule, defined in configuration and registered on release
+-- activation, like schedules (06) and perimeters (11).
+entity AlertRule {
+    name: String
+    definition_hash: String
+    release: cfg/ConfigurationRelease
+    owner: data/User
+    -- threshold: value beyond a limit; day_change: change from the previous
+    -- as_of beyond a percentage or amount; outlier: statistical outlier
+    -- against recent history; capital_move: change in capital beyond an
+    -- amount. Data and run problems are always alerts (no rule needed).
+    kind: threshold | day_change | outlier | capital_move
+    figure_pattern: String
+    parameters_hash: String
+}
+
+entity Alert {
+    source: rule_breach | data_problem | run_problem
+    rule: AlertRule?
+    figure: ReportedFigure?
+    subject_ref: String
+    description: String
+    raised_at: Timestamp
+    owner: data/User
+    escalated: Boolean
+    acknowledged_by: data/User?
+    acknowledged_at: Timestamp?
+    resolved_note: String?
+    alert_state: raised | acknowledged | resolved
+
+    transitions alert_state {
+        raised -> acknowledged
+        raised -> resolved
+        acknowledged -> resolved
+        terminal: resolved
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    signoff_due_after: Duration = 4.hours
+    figure_retention: Duration = 3653.days
+    alert_escalation_after: Duration = 1.hours
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Every publication waits for sign-off; consumers receive it only once
+-- signed off (D-038).
+rule OpenSignOff {
+    when: publication: batch/RunPublication.created
+    ensures:
+        ReportSignOff.created(
+            publication: publication,
+            needs_second_signer: is_regulatory(publication.run.schedule),
+            created_at: now,
+            due_at: now + config.signoff_due_after,
+            escalated: false,
+            signoff: awaiting_signoff
+        )
+        for f in published_figures(publication):
+            FigureReported(publication: publication, figure: f)
+}
+
+rule RecordFigure {
+    when: FigureReported(publication, figure)
+    ensures: ReportedFigure.created(
+        publication: publication,
+        figure_key: figure_key_of(figure),
+        as_of: publication.run.as_of,
+        value: figure_value(figure),
+        currency: figure_currency(figure),
+        data_class: publication.run.schedule.data_class,
+        source_calc_id: figure_calc_id(figure),
+        recorded_at: now,
+        retained_until: now + config.figure_retention
+    )
+}
+
+-- A signer is never the person who requested the run (e.g. the operator who
+-- asked for a restatement): production and approval stay separate.
+rule SignOffReport {
+    when: ReportSignedOff(signer, signoff)
+    requires: signoff.signoff in {awaiting_signoff, partly_signed}
+    requires: data/permitted(signer, "report.signoff", signoff.publication.run.schedule.name)
+    requires: data/freshly_authenticated(signer)
+    requires: signer != signoff.publication.run.requested_by
+    requires: signoff.signoff = awaiting_signoff or signer != signoff.first_signer
+    -- Completeness (16, D-042): every material reconciliation break
+    -- affecting this publication is at least explained.
+    requires: not has_unexplained_material_breaks(signoff.publication)
+    -- Regulatory reports (19, D-047): none of the publication's report files
+    -- has a blocking validation finding.
+    requires: not has_blocking_report_findings(signoff.publication)
+    ensures:
+        if signoff.signoff = awaiting_signoff:
+            signoff.first_signer = signer
+            if signoff.needs_second_signer:
+                signoff.signoff = partly_signed
+            else:
+                signoff.signoff = signed_off
+                ReportReleased(signoff: signoff)
+        else:
+            signoff.second_signer = signer
+            signoff.signoff = signed_off
+            ReportReleased(signoff: signoff)
+}
+
+-- Withheld: the figures are not released; the schedule owner decides on a
+-- restatement or investigation (06).
+rule WithholdReport {
+    when: ReportWithheld(signer, signoff, reason)
+    requires: signoff.signoff in {awaiting_signoff, partly_signed}
+    requires: data/permitted(signer, "report.signoff", signoff.publication.run.schedule.name)
+    requires: data/freshly_authenticated(signer)
+    ensures:
+        signoff.signoff = withheld
+        signoff.withheld_reason = reason
+        ReportWithheldNotice(signoff: signoff, owner: signoff.publication.run.schedule.owner)
+}
+
+rule SignOffOverdue {
+    when: signoff: ReportSignOff.due_at <= now
+    requires: signoff.signoff in {awaiting_signoff, partly_signed}
+    requires: not signoff.escalated
+    ensures:
+        signoff.escalated = true
+        SignOffEscalated(signoff: signoff, owner: signoff.publication.run.schedule.owner)
+}
+
+-- Alert rules come only from configuration releases.
+rule RegisterReleaseAlertRules {
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for d in release_alert_rules(release):
+            AlertRuleDefined(release: release, definition: d)
+}
+
+rule CreateAlertRule {
+    when: AlertRuleDefined(release, definition)
+    requires: not exists AlertRule{definition_hash: alert_definition_hash(definition)}
+    ensures: AlertRule.created(
+        name: alert_name(definition),
+        definition_hash: alert_definition_hash(definition),
+        release: release,
+        owner: alert_owner(definition),
+        kind: alert_kind(definition),
+        figure_pattern: alert_pattern(definition),
+        parameters_hash: alert_parameters_hash(definition)
+    )
+}
+
+-- Each new figure is checked against every matching rule of the active
+-- release; history comes from earlier ReportedFigures with the same key.
+rule CheckFigure {
+    when: figure: ReportedFigure.created
+    ensures:
+        for r in alert_rules_matching(figure.figure_key):
+            if breaches(r, figure):
+                RuleBreached(rule: r, figure: figure)
+}
+
+rule RaiseRuleAlert {
+    when: RuleBreached(rule, figure)
+    requires: not exists Alert{rule: rule, figure: figure}
+    ensures: Alert.created(
+        source: rule_breach,
+        rule: rule,
+        figure: figure,
+        subject_ref: figure.figure_key,
+        description: breach_description(rule, figure),
+        raised_at: now,
+        owner: rule.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RaiseDataAlert {
+    when: ingest/DataQualityAlert(source, problem)
+    ensures: Alert.created(
+        source: data_problem,
+        subject_ref: source_ref(source),
+        description: problem,
+        raised_at: now,
+        owner: source_owner(source),
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RaiseRunFailureAlert {
+    when: batch/BatchRunFailed(run, owner)
+    ensures: Alert.created(
+        source: run_problem,
+        subject_ref: run.run_ref,
+        description: "batch run failed",
+        raised_at: now,
+        owner: owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RaiseDeadlineAlert {
+    when: batch/BatchDeadlineMissed(run, owner)
+    ensures: Alert.created(
+        source: run_problem,
+        subject_ref: run.run_ref,
+        description: "batch deadline missed",
+        raised_at: now,
+        owner: owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RaiseLateStartAlert {
+    when: batch/LateRunStarted(schedule, cutoff, owner)
+    ensures: Alert.created(
+        source: run_problem,
+        subject_ref: schedule.name,
+        description: "batch run started late",
+        raised_at: now,
+        owner: owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+-- Delivery: in the app and by email (D-038).
+rule NotifyAlert {
+    when: alert: Alert.created
+    ensures: AlertNotified(alert: alert, recipient: alert.owner, channels: {"in_app", "email"})
+}
+
+rule AcknowledgeAlert {
+    when: AlertAcknowledged(user, alert)
+    requires: alert.alert_state = raised
+    requires: data/permitted(user, "alert.acknowledge", alert.subject_ref)
+    ensures:
+        alert.alert_state = acknowledged
+        alert.acknowledged_by = user
+        alert.acknowledged_at = now
+}
+
+rule ResolveAlert {
+    when: AlertResolved(user, alert, note)
+    requires: alert.alert_state in {raised, acknowledged}
+    requires: data/permitted(user, "alert.resolve", alert.subject_ref)
+    ensures:
+        alert.alert_state = resolved
+        alert.resolved_note = note
+}
+
+rule EscalateUnacknowledgedAlert {
+    when: alert: Alert.raised_at + config.alert_escalation_after <= now
+    requires: alert.alert_state = raised
+    requires: not alert.escalated
+    ensures:
+        alert.escalated = true
+        AlertEscalated(alert: alert, escalate_to: escalation_contact(alert.owner))
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant TwoSignersForRegulatory {
+    for s in ReportSignOffs:
+        s.signoff = signed_off and s.needs_second_signer
+            implies s.second_signer != null and s.second_signer != s.first_signer
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor RiskReviewer {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ReportReview {
+    facing reviewer: RiskReviewer
+    context signoff: ReportSignOff
+
+    exposes:
+        signoff.publication.run.schedule.name
+        signoff.publication.run.as_of
+        signoff.publication.run.rerun_mode
+        signoff.signoff
+        signoff.due_at
+        signoff.first_signer
+        signoff.needs_second_signer
+        figures_of(signoff.publication)
+        changes_from_previous(signoff.publication)
+        excluded_positions(signoff.publication)
+        breaks_affecting(signoff.publication)
+
+    provides:
+        ReportSignedOff(reviewer, signoff) when signoff.signoff in {awaiting_signoff, partly_signed}
+        ReportWithheld(reviewer, signoff, reason) when signoff.signoff in {awaiting_signoff, partly_signed}
+        web/ExportRequested(reviewer, view_ref, format)
+
+    contracts:
+        demands web/WebFrontEnd
+}
+
+surface AlertInbox {
+    facing reviewer: RiskReviewer
+    context alert: Alert where owner = reviewer
+
+    exposes:
+        alert.source
+        alert.subject_ref
+        alert.description
+        alert.raised_at
+        alert.alert_state
+        alert.escalated
+
+    provides:
+        AlertAcknowledged(reviewer, alert) when alert.alert_state = raised
+        AlertResolved(reviewer, alert, note) when alert.alert_state in {raised, acknowledged}
+
+    contracts:
+        demands web/WebFrontEnd
+}
+
+-- Trends over time for one figure key. Basis "restated" (default) uses the
+-- publication in effect for each as_of; "as_reported" uses the first; the
+-- differences between the two are listed. Drill-down follows source_calc_id
+-- through the graph's provenance to positions and inputs.
+surface FigureTrends {
+    facing reviewer: RiskReviewer
+    context figure: ReportedFigure
+
+    exposes:
+        figure.figure_key
+        figure.as_of
+        figure.value
+        figure.currency
+        figure.data_class
+        figure.publication.state
+        trend_of(figure.figure_key, "restated")
+        trend_of(figure.figure_key, "as_reported")
+        restatement_differences(figure.figure_key)
+        contributors_of(figure.source_calc_id)
+
+    provides:
+        web/ExportRequested(reviewer, view_ref, format)
+
+    contracts:
+        demands web/WebFrontEnd
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- is_regulatory(schedule): from the schedule's configuration.
+-- has_unexplained_material_breaks, breaks_affecting, excluded_positions:
+--   reconciliation breaks (16) on the sources and business date of the
+--   publication's run, and the positions its plan excluded (16).
+-- has_blocking_report_findings(publication): any report generated for the
+--   publication (19) in state failed_validation.
+-- published_figures, figure_key_of, figure_value, figure_currency,
+--   figure_calc_id: the aggregate figures of a run, read from its result
+--   nodes (Julia-produced payloads, D-018).
+-- release_alert_rules, alert_* accessors: from the release artefacts (05).
+-- alert_rules_matching(key): rules of the active release whose pattern
+--   matches. breaches(rule, figure): evaluated against the rule's
+--   parameters and the figure's history (earlier ReportedFigures).
+-- source_ref, source_owner: from the data source (10).
+-- escalation_contact(user): the on-call rota in configuration (D-039).
+-- trend_of, restatement_differences, figures_of, changes_from_previous,
+--   contributors_of: queries over ReportedFigures and graph provenance.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-038): sign-off before release, two signers for regulatory
+-- figures; all four rule kinds plus data and run problems; in-app plus email
+-- with escalation; figures kept 10 years (to be confirmed with compliance);
+-- trends restated by default with as-reported a click away; drill-down only
+-- in v1.
+-- Resolved (D-039): escalation goes to a configured on-call rota.
+open question "Retention of reported figures (10 years assumed, for all figures): to be confirmed by the bank's compliance function against its record-keeping obligations."

@@ -1,0 +1,568 @@
+-- allium: 3
+-- 20-production-operations.allium
+
+-- Scope: Running Veridian in production: recovery from failure, rolling out
+--   new releases of the platform itself, resuming interrupted runs, drills
+--   that prove recovery works, and watching storage (D-048).
+-- Includes: recovery objectives and incidents, restore drills, platform
+--   releases (control plane code, database schema, worker builds) with a
+--   freeze window around runs, emergency changes, resumption of runs after a
+--   failover, storage measurements and alerts.
+-- Excludes:
+--   - Configuration releases (05): models, schedules, rate cards; reused.
+--   - The bank's own infrastructure choices (database cluster product,
+--     replication technology, data centres): recorded by the bank in its
+--     operating procedures; this spec states what the platform requires.
+--   - User access, break-glass and audit (04); access to the database or
+--     hosts by administrators is an open question here.
+-- Dependencies: 01, 02, 06, 07, 13.
+--
+-- Principles (D-048):
+--   - The ledger is the single source of truth. Anything in memory, on a
+--     worker or in a cache can be lost and rebuilt from it; nothing a run
+--     needs lives only on one host.
+--   - Recovery objectives are configuration the bank overrides with its own
+--     policy; the defaults are zero data loss for the ledger, the audit
+--     trail and the reported figures (a synchronous standby), and a restore
+--     within one hour so that an end-of-day run can still make its cut-off.
+--   - A platform change is a release like any other: authored, approved by
+--     a different person, with evidence. Production and approval stay apart.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./06-batch-scheduling.allium" as batch
+use "./07-julia-workers.allium" as workers
+use "./13-report-review-alerts-trends.allium" as review
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- control_plane: Elixir application code. schema: the ledger and object
+-- store layout. worker_build: a Julia system image and manifest (07).
+enum PlatformReleaseKind { control_plane | schema | worker_build }
+
+enum StoreKind { ledger | payloads | audit | figures | reports }
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract RunRecovery {
+    resume: (run_ref: String) -> String
+
+    @invariant ResumeFromLedger
+        -- After a failover or restore, every run that was running continues
+        -- from the ledger: nodes already complete stay complete and are never
+        -- recomputed (memoization, 02); nodes that were assigned to a worker
+        -- the platform can no longer vouch for are dispatched again (07).
+
+    @invariant SameCutoffAndAsOf
+        -- A resumed run keeps its original cut-off, as-of date and known_at
+        -- (06, D-029). No second run is created for the same run reference.
+
+    @invariant NoLoss
+        -- No acknowledged ledger write is lost when the recovery point
+        -- objective is zero: a completed node, a sign-off, an audit entry or
+        -- a reported figure that was acknowledged before the failure exists
+        -- after it.
+
+    @invariant LateIsAlertedNotHidden
+        -- A run that is still unfinished at its deadline raises the alert of
+        -- spec 06 as usual; recovery never moves a deadline.
+
+    @invariant BuildsOutliveRuns
+        -- A worker build is never retired while a running run has tickets
+        -- that need it (07).
+}
+
+contract ProductionReadiness {
+    @invariant DrillBeforeGoLive
+        -- Production does not go live until a restore drill has met the
+        -- recovery objectives, with its evidence kept; and a failover has
+        -- been rehearsed once under load.
+
+    @invariant FreezeWindowKnown
+        -- The freeze window of every schedule is visible to operators
+        -- before they start a release: which runs it covers and until when.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A release of the platform itself. Not a configuration release (05).
+entity PlatformRelease {
+    tag: String
+    kind: PlatformReleaseKind
+    submitted_by: data/User
+    submitted_at: Timestamp
+    -- A schema change is only accepted when the previous code keeps working
+    -- with it (add first, remove in a later release).
+    compatible_with_previous: Boolean
+    -- An emergency change may start inside the freeze window.
+    emergency: Boolean
+    approved_by: data/User?
+    review_needed: Boolean
+    reviewed_by: data/User?
+    refusal_reason: String?
+    status: submitted | approved | rolling_out | active | rolled_back | superseded | refused
+
+    transitions status {
+        submitted -> approved
+        submitted -> refused
+        approved -> rolling_out
+        rolling_out -> active
+        rolling_out -> rolled_back
+        active -> rolled_back
+        active -> superseded
+        terminal: rolled_back, superseded, refused
+    }
+
+    invariant ApproverIsNotAuthor {
+        approved_by != null implies approved_by != submitted_by
+    }
+}
+
+-- A failover or a restore from backup. Declared by an operator, closed when
+-- the platform serves again, reviewed afterwards by someone else.
+entity PlatformIncident {
+    kind: failover | restore
+    declared_by: data/User
+    declared_at: Timestamp
+    -- The time of the newest acknowledged write that survived.
+    recovered_to: Timestamp?
+    recovered_at: Timestamp?
+    data_loss: Duration?
+    downtime: Duration?
+    objectives_met: Boolean?
+    reviewed_by: data/User?
+    state: open | recovered | reviewed
+
+    transitions state {
+        open -> recovered
+        recovered -> reviewed
+        terminal: reviewed
+    }
+}
+
+-- A rehearsal of recovery in an environment that is not production.
+entity RestoreDrill {
+    performed_by: data/User
+    performed_at: Timestamp
+    took: Duration
+    data_loss: Duration
+    objectives_met: Boolean
+    evidence_ref: String
+    reviewed_by: data/User?
+}
+
+-- One reading of how full a store is and how fast it grows.
+entity StorageMeasurement {
+    store: StoreKind
+    used_bytes: Integer
+    capacity_bytes: Integer
+    daily_growth_bytes: Integer
+    measured_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Defaults are the platform's own; the bank sets its policy (open questions).
+    recovery_point_objective: Duration = 0.seconds
+    recovery_time_objective: Duration = 1.hours
+    restore_drill_interval: Duration = 90.days
+    -- Emergency changes made inside the freeze window are reviewed by someone
+    -- other than the author within this time.
+    emergency_review_due: Duration = 1.days
+    storage_warning_fraction: Decimal = 0.7
+    storage_forecast_horizon: Duration = 90.days
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Platform releases
+
+rule ReceivePlatformRelease {
+    when: PlatformReleaseSubmitted(submitter, tag, kind, compatible_with_previous, emergency)
+    requires: data/permitted(submitter, "platform.submit", kind)
+    requires: not exists PlatformRelease{tag: tag}
+    ensures: PlatformRelease.created(
+        tag: tag,
+        kind: kind,
+        submitted_by: submitter,
+        submitted_at: now,
+        compatible_with_previous: compatible_with_previous,
+        emergency: emergency,
+        review_needed: false,
+        status: submitted
+    )
+}
+
+-- A schema change that the previous code cannot run against is refused: a
+-- rolling restart needs old and new code to share one schema for a while.
+rule RefuseIncompatibleSchema {
+    when: release: PlatformRelease.created
+    requires: release.kind = schema
+    requires: not release.compatible_with_previous
+    ensures:
+        release.status = refused
+        release.refusal_reason = "schema change is not compatible with the running code; release it in two steps"
+}
+
+rule ApprovePlatformRelease {
+    when: PlatformReleaseApproved(approver, release)
+    requires: release.status = submitted
+    requires: approver != release.submitted_by
+    requires: data/permitted(approver, "platform.approve", release.kind)
+    requires: data/freshly_authenticated(approver)
+    ensures:
+        release.status = approved
+        release.approved_by = approver
+}
+
+-- Outside the freeze window any approved release may start; inside it only an
+-- emergency one, and then the runs in progress are flagged for review (06)
+-- and the change itself must be reviewed by a third pair of eyes.
+rule StartRollout {
+    when: PlatformRolloutStarted(operator, release)
+    requires: release.status = approved
+    requires: data/permitted(operator, "platform.rollout", release.kind)
+    requires: not run_window_open(now) or release.emergency
+    ensures:
+        release.status = rolling_out
+        if run_window_open(now):
+            release.review_needed = true
+            for r in running_runs(now):
+                r.review_flag = true
+                r.review_reason = "platform release during the run"
+            EmergencyChangeStarted(release: release, owner: platform_owner())
+}
+
+rule FinishRollout {
+    when: PlatformRolloutFinished(operator, release)
+    requires: release.status = rolling_out
+    requires: data/permitted(operator, "platform.rollout", release.kind)
+    ensures:
+        release.status = active
+        PlatformReleaseActivated(release: release, previous: active_platform_release(release.kind))
+}
+
+-- Exactly one active release per kind; activation and supersession share one
+-- instant, as for configuration releases (05).
+rule SupersedePreviousPlatformRelease {
+    when: PlatformReleaseActivated(release, previous)
+    requires: previous != null
+    requires: previous.status = active
+    requires: previous != release
+    ensures: previous.status = superseded
+}
+
+rule RollBackRollout {
+    when: PlatformRolloutRolledBack(operator, release, reason)
+    requires: release.status in {rolling_out, active}
+    requires: data/permitted(operator, "platform.rollout", release.kind)
+    ensures:
+        release.status = rolled_back
+        release.refusal_reason = reason
+        review/Alert.created(
+            source: run_problem,
+            subject_ref: release.tag,
+            description: "platform release rolled back",
+            raised_at: now,
+            owner: platform_owner(),
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule ReviewEmergencyChange {
+    when: EmergencyChangeReviewed(reviewer, release)
+    requires: release.review_needed
+    requires: release.reviewed_by = null
+    requires: reviewer != release.submitted_by and reviewer != release.approved_by
+    requires: data/permitted(reviewer, "platform.review", release.kind)
+    ensures: release.reviewed_by = reviewer
+}
+
+rule EmergencyReviewOverdue {
+    when: release: PlatformRelease.submitted_at + config.emergency_review_due <= now
+    requires: release.review_needed
+    requires: release.reviewed_by = null
+    ensures: review/Alert.created(
+        source: run_problem,
+        subject_ref: release.tag,
+        description: "emergency platform change not reviewed in time",
+        raised_at: now,
+        owner: platform_owner(),
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+-- Failover, restore and recovery
+
+rule DeclareIncident {
+    when: IncidentDeclared(operator, kind)
+    requires: data/permitted(operator, "platform.recover", kind)
+    requires: data/freshly_authenticated(operator)
+    ensures: PlatformIncident.created(
+        kind: kind,
+        declared_by: operator,
+        declared_at: now,
+        state: open
+    )
+}
+
+-- The platform serves again. The data loss is the gap between the newest
+-- write that survived and the moment of failure; objectives are checked
+-- against the configuration, and a miss is an alert.
+rule RecordRecovery {
+    when: RecoveryRecorded(operator, incident, recovered_to)
+    requires: incident.state = open
+    requires: data/permitted(operator, "platform.recover", incident.kind)
+    ensures:
+        incident.state = recovered
+        incident.recovered_to = recovered_to
+        incident.recovered_at = now
+        incident.data_loss = incident.declared_at - recovered_to
+        incident.downtime = now - incident.declared_at
+        incident.objectives_met =
+            incident.declared_at - recovered_to <= config.recovery_point_objective
+                and now - incident.declared_at <= config.recovery_time_objective
+        if not incident.objectives_met:
+            review/Alert.created(
+                source: run_problem,
+                subject_ref: "platform recovery",
+                description: "recovery objectives missed",
+                raised_at: now,
+                owner: platform_owner(),
+                escalated: false,
+                alert_state: raised
+            )
+        RunsResumable(incident: incident)
+}
+
+-- Every live host's heartbeat clock restarts at recovery. Without this, the
+-- silence caused by the outage itself would make every host look lost (07,
+-- HostSilent) and all their work would be dispatched again.
+rule ResumeAfterRecovery {
+    when: RunsResumable(incident)
+    ensures:
+        for h in workers/live_hosts():
+            h.last_heartbeat = now
+        for r in running_runs(now):
+            RunResumed(run: r, incident: incident)
+}
+
+rule ReviewIncident {
+    when: IncidentReviewed(reviewer, incident)
+    requires: incident.state = recovered
+    requires: reviewer != incident.declared_by
+    requires: data/permitted(reviewer, "platform.review", incident.kind)
+    ensures:
+        incident.state = reviewed
+        incident.reviewed_by = reviewer
+}
+
+-- Drills prove that the objectives can be met, not just that backups exist.
+rule RecordRestoreDrill {
+    when: RestoreDrillRecorded(operator, took, data_loss, evidence_ref)
+    requires: data/permitted(operator, "platform.drill", "restore")
+    ensures:
+        RestoreDrill.created(
+            performed_by: operator,
+            performed_at: now,
+            took: took,
+            data_loss: data_loss,
+            objectives_met: data_loss <= config.recovery_point_objective
+                and took <= config.recovery_time_objective,
+            evidence_ref: evidence_ref
+        )
+}
+
+-- Fires for the newest drill once the interval has passed. Before the first
+-- drill there is nothing to fire on, which is why go-live itself requires one
+-- (ProductionReadiness).
+rule RestoreDrillDue {
+    when: drill: RestoreDrill.performed_at + config.restore_drill_interval <= now
+    requires: drill = newest_restore_drill()
+    ensures: review/Alert.created(
+        source: run_problem,
+        subject_ref: "restore drill",
+        description: "no restore drill within the agreed interval",
+        raised_at: now,
+        owner: platform_owner(),
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+-- Storage
+
+rule RecordStorage {
+    when: StorageMeasured(collector, store, used_bytes, capacity_bytes, daily_growth_bytes)
+    requires: data/permitted(collector, "platform.measure", store)
+    ensures: StorageMeasurement.created(
+        store: store,
+        used_bytes: used_bytes,
+        capacity_bytes: capacity_bytes,
+        daily_growth_bytes: daily_growth_bytes,
+        measured_at: now
+    )
+}
+
+-- Either already too full, or on its present growth too full within the
+-- forecast horizon. Retention (13, 02) is configuration the bank can tighten,
+-- but the platform never purges what a retention class still requires.
+rule StorageRunningOut {
+    when: m: StorageMeasurement.created
+    requires: m.used_bytes >= m.capacity_bytes * config.storage_warning_fraction
+        or m.used_bytes + m.daily_growth_bytes * config.storage_forecast_horizon.days >= m.capacity_bytes
+    ensures: review/Alert.created(
+        source: run_problem,
+        subject_ref: m.store,
+        description: "store is filling up",
+        raised_at: now,
+        owner: platform_owner(),
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant EmergencyChangesAreReviewed {
+    for r in PlatformReleases:
+        r.review_needed and r.reviewed_by != null
+            implies r.reviewed_by != r.submitted_by and r.reviewed_by != r.approved_by
+}
+
+invariant RolloutNeedsApproval {
+    for r in PlatformReleases:
+        r.status in {rolling_out, active, superseded} implies r.approved_by != null
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor PlatformOperator {
+    identified_by: data/User
+}
+
+actor PlatformService {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface PlatformReleases {
+    facing operator: PlatformOperator
+    context release: PlatformRelease
+
+    exposes:
+        release.tag
+        release.kind
+        release.status
+        release.submitted_by
+        release.approved_by
+        release.emergency
+        release.review_needed
+        release.reviewed_by
+        release.compatible_with_previous
+
+    provides:
+        PlatformReleaseSubmitted(operator, tag, kind, compatible_with_previous, emergency)
+        PlatformReleaseApproved(operator, release) when release.status = submitted
+        PlatformRolloutStarted(operator, release) when release.status = approved
+        PlatformRolloutFinished(operator, release) when release.status = rolling_out
+        PlatformRolloutRolledBack(operator, release, reason) when release.status in {rolling_out, active}
+        EmergencyChangeReviewed(operator, release) when release.review_needed and release.reviewed_by = null
+}
+
+surface PlatformRecovery {
+    facing operator: PlatformOperator
+    context incident: PlatformIncident
+
+    exposes:
+        incident.kind
+        incident.declared_by
+        incident.declared_at
+        incident.recovered_to
+        incident.recovered_at
+        incident.data_loss
+        incident.downtime
+        incident.objectives_met
+        incident.state
+
+    provides:
+        IncidentDeclared(operator, kind)
+        RecoveryRecorded(operator, incident, recovered_to) when incident.state = open
+        IncidentReviewed(operator, incident) when incident.state = recovered
+        RestoreDrillRecorded(operator, took, data_loss, evidence_ref)
+
+    contracts:
+        demands RunRecovery
+        demands ProductionReadiness
+}
+
+surface StorageWatch {
+    facing collector: PlatformService
+    context measurement: StorageMeasurement
+
+    exposes:
+        measurement.store
+        measurement.used_bytes
+        measurement.capacity_bytes
+        measurement.daily_growth_bytes
+        measurement.measured_at
+
+    provides:
+        StorageMeasured(collector, store, used_bytes, capacity_bytes, daily_growth_bytes)
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- run_window_open(t): true from the moment capacity is requested for a
+--   schedule's next run (06, RequestRunCapacity) until that run's publication
+--   is signed off or withheld (13). A release never starts inside it unless
+--   it is an emergency.
+-- running_runs(t): the batch runs in status running at t (06).
+-- workers/live_hosts(): hosts whose presence is joining, serving or retiring
+--   (07).
+-- newest_restore_drill(): the RestoreDrill with the latest performed_at.
+-- active_platform_release(kind): the platform release of that kind now
+--   active, if any (at most one).
+-- platform_owner(): the on-call rota of the platform team, in configuration
+--   (05, D-039).
+-- RunResumed, EmergencyChangeStarted: events for the console (12) and alerts.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-048): zero data loss and restore within an hour as defaults; a
+-- rolling release with a freeze window around runs; interrupted runs resume
+-- from the ledger with the same cut-off.
+open question "The bank's own recovery objectives and drill interval (the defaults are placeholders): confirm against its operational resilience policy."
+open question "Disaster recovery site: is a second data centre in scope for v1, and who operates the failover?"
+-- Resolved (D-054): administrators of the database and hosts use named
+-- personal accounts, never shared ones; access to production data needs an
+-- approval recorded in Veridian's audit (04); host and database logs are
+-- shipped to the audit store and reconciled against the approvals, and an
+-- access with no matching approval is raised as an alert (12).
+open question "How the reconciliation of administrator access logs against approvals is run and by whom (operations or an independent control), and the retention of those logs."
+open question "Whole life: how is the platform decommissioned, and where do retained figures and reports go when it is?"
+open question "Storage capacity and measured growth are unknown: the spike did not measure them, so the thresholds are placeholders until production-class sizing."

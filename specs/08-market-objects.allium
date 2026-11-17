@@ -1,0 +1,127 @@
+-- allium: 3
+-- 08-market-objects.allium
+
+-- Scope: Calibrated market objects that pricing consumes, and the rules every
+--   calibration obeys. Owned by Julia (D-018); this spec is the contract.
+-- Includes: discount and forwarding curves, credit (hazard / spread) curves,
+--   equity volatility surfaces, the swaption volatility cube, dividend
+--   schedules, FX spots; calibration from quotes by recipe; shocked objects
+--   for FRTB.
+-- Excludes:
+--   - Quote storage and versioning (01: ordinary bitemporal input series).
+--   - Recipes themselves: configuration artefacts in a release (05, D-016).
+--   - Instrument pricing (09 onwards) and FRTB aggregation (later spec).
+-- Dependencies: 01, 02, 03, 05.
+--
+-- Every market object is the result of a calculation node (02): its calc_id
+-- covers the recipe's content hash, the quote versions, the calendar versions
+-- and any prerequisite objects (e.g. a forwarding curve depends on the
+-- discount curve). Two runs that see the same quotes share the same curve.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract MarketObjectCalibration {
+    calibrate: (recipe_hash: String, quotes: Set<data/InputVersion>, calendars: Set<data/InputVersion>, prerequisites: Set<String>, as_of: Timestamp) -> String
+    shock: (object_ref: String, shock_spec: String) -> String
+
+    @invariant RecipeDefinesEverything
+        -- A recipe states the object kind, the instruments used and their
+        -- conventions, the interpolation and extrapolation, the calibration
+        -- method and the repricing tolerance. Nothing is defaulted silently.
+
+    @invariant RepricesItsInputs
+        -- A calibrated object reprices every input quote within the recipe's
+        -- tolerance; the residual per quote is part of the result.
+
+    @invariant FailureIsRejection
+        -- No fit within tolerance, a missing mandatory quote, or an
+        -- arbitrage violation is a deterministic rejection (02,
+        -- ComputationRejected) naming the cause, never a crash and never a
+        -- partial object.
+
+    @invariant NoArbitrage
+        -- Discount factors are positive (negative rates are allowed);
+        -- survival probabilities are positive and non-increasing; volatility
+        -- surfaces are free of calendar and butterfly arbitrage on the
+        -- recipe's grid.
+
+    @invariant ShockedObjectsAreObjects
+        -- shock(object, spec) is a pure function of the base object and the
+        -- shock specification (e.g. FRTB risk-factor bump). A shocked object
+        -- is an ordinary node, memoized like any other, so many revaluations
+        -- share their unshocked prerequisites.
+
+    @invariant CreditCurveSources
+        -- An issuer credit curve is calibrated from the issuer's CDS quotes;
+        -- where there are none, from bond-implied spreads; the order is part
+        -- of the recipe (D-051). An issuer with neither uses a proxy curve
+        -- chosen by sector, rating and region from a table in the recipe. The
+        -- basis (quoted CDS, bond-implied or proxy) and, for a proxy, the
+        -- proxy key and the matching rule, are part of the curve object's
+        -- result, so every valuation and every default risk figure that
+        -- reads the curve can show it. A proxy is never used silently, and an
+        -- issuer matched by no proxy rule is a deterministic rejection.
+
+    @invariant CalibrationMayDifferentiate
+        -- Automatic differentiation may be used inside calibration (F-2);
+        -- results are still canonically rounded before hashing (D-015).
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor CalibrationWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface MarketObjectComputation {
+    facing worker: CalibrationWorker
+
+    contracts:
+        demands MarketObjectCalibration
+        demands graph/DeterministicComputation
+
+    @guarantee ResidualsReported
+        -- Every calibrated object carries its per-quote residuals and the
+        -- recipe hash, so a reviewer can see how well it fits.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- v1 object kinds (D-022):
+--   discount curves: OIS per currency (USD SOFR, EUR ESTR, GBP SONIA, HKD HONIA)
+--   forwarding curves per index
+--   credit curves per issuer and seniority (bonds, DRC)
+--   swaption volatility cube (callable bonds via Hull-White calibration)
+--   equity volatility surface and dividend schedule per underlying
+--   FX spot per currency pair (FRTB aggregation)
+-- Data sourcing (D-034): no paid subscriptions. Quotes enter through
+-- replaceable ingestion adapters as ordinary input versions, so a bank can
+-- plug in its own feeds. v1: free public sources where their terms allow
+-- (overnight fixings, central-bank curves, ECB FX reference rates), seeded
+-- synthetic data elsewhere (OIS par quotes where not published, credit
+-- curves, equity volatility surfaces, dividends, swaption volatilities).
+-- Synthetic data is data_class synthetic, never mixed with production (D-010).
+-- v1 indices are overnight only (SOFR, ESTR, SONIA, HONIA); licensed term
+-- rates (EURIBOR, HIBOR) are out.
+-- Resolved (D-035): a recipe may calibrate to a published curve when its
+-- source's terms allow it; the Bank of England yield curves do not qualify
+-- without written permission, so v1 uses seeded synthetic OIS par quotes.
+-- SVI per expiry for equity surfaces, SABR for the swaption cube; dividends
+-- as forecast cash amounts near term and a yield further out.
+-- Resolved (D-051): credit curves from CDS quotes, else bond-implied spreads;
+-- issuers without either use a disclosed proxy by sector, rating and region.
+-- v1 still uses synthetic data (D-034), so this fixes the intended design
+-- only; a vendor spread curve stays outside v1 (paid data).

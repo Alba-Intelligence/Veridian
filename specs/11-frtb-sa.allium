@@ -1,0 +1,240 @@
+-- allium: 3
+-- 11-frtb-sa.allium
+
+-- Scope: Basel FRTB standardised approach (MAR21 sensitivities-based method,
+--   MAR22 default risk charge) for the v1 instruments (D-002, D-022).
+-- Includes: reporting perimeters, sensitivity, vega and curvature
+--   computation as graph nodes, bucketing, aggregation under three
+--   correlation scenarios, desk-level standalone results, DRC.
+-- Excludes:
+--   - Valuation of each instrument (09 and later pricing specs).
+--   - Regulatory report formats and submission: spec 19 (D-047).
+--   - Residual risk add-on (RRAO, MAR23): not needed for v1 vanilla
+--     instruments; see open question.
+-- Dependencies: 01, 02, 05, 06, 08, 09.
+--
+-- Sources (F-3): BCBS consolidated framework, MAR21 (in force 2023-01-01,
+-- published 2026-03-23) and MAR22 (published 2020-03-27). Every parameter
+-- (tenors, risk weights, correlations, shock sizes, LGDs) is a configuration
+-- artefact citing its paragraph; formulas are implemented exactly as
+-- prescribed. Several formulas are images on the BIS pages and must be taken
+-- from the official PDF before implementation.
+--
+-- Computation as a graph (D-032), for one perimeter and as_of:
+--   base market objects (08) -> shocked market objects, one per risk factor
+--     and shift (MAR21.19-21.25: 1 bp absolute for rates and spreads, 1%
+--     relative for equity and FX, implied-volatility bump for vega; curvature
+--     up and down shocks, GIRR shifted in parallel, MAR21.5, 21.8(5))
+--   -> per-position sensitivity node: revalues the position under its base and
+--     shocked objects and returns delta, vega and curvature inputs, mapped to
+--     tenors and buckets (one node per position, consuming shared shocked
+--     objects, so shocked curves are calibrated once per perimeter)
+--   -> per-bucket aggregation (Kb) -> across buckets -> per correlation
+--     scenario (low, medium, high: MAR21.6) -> per risk class -> maximum of the
+--     three scenario totals (MAR21.7)
+--   -> DRC (MAR22) per obligor -> per bucket -> total.
+-- Sensitivities are expressed in the perimeter's reporting currency and FX
+-- risk factors are rates against it (MAR21.14-21.15).
+-- Execution (D-037): the EOD run's peak is served by hosts allocated from the
+-- bank's Slurm grid (spec 07); the graph, not Slurm, distributes the nodes.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract FrtbStandardisedApproach {
+    position_sensitivities: (position: data/InputVersion, base_objects: Set<String>, shocked_objects: Set<String>, parameters_hash: String) -> String
+    aggregate: (sensitivities: Set<String>, parameters_hash: String, reporting_currency: String) -> String
+    default_risk_charge: (positions: Set<data/InputVersion>, reference_data: Set<data/InputVersion>, parameters_hash: String, reporting_currency: String) -> String
+
+    @invariant PrescribedShifts
+        -- Delta: change in value for the prescribed shift divided by the
+        -- shift (MAR21.19-21.24). Vega: vega times implied volatility, mapped
+        -- to option maturity tenors 0.5, 1, 3, 5, 10 years (MAR21.25). Any
+        -- other method (e.g. automatic differentiation) only after it is shown
+        -- to give very close results (MAR21.16 FAQ1) and approved.
+
+    @invariant ReportingCurrency
+        -- All sensitivities and charges of a perimeter are in that
+        -- perimeter's reporting currency; FX risk factors are exchange rates
+        -- against it (MAR21.14-21.15). The consolidated perimeter converts
+        -- every entity with one group FX snapshot at a configured fixing
+        -- (09, ConsolidationFxSnapshot, D-051).
+
+    @invariant ThreeScenarios
+        -- Aggregation runs under low, medium and high correlation scenarios;
+        -- the capital is the largest scenario total, and the same is computed
+        -- for each trading desk standalone (MAR21.6-21.7).
+
+    @invariant GirrStructure
+        -- GIRR tenors 0.25, 0.5, 1, 2, 3, 5, 10, 15, 20, 30 years; one bucket
+        -- per currency; OIS and other curves are distinct curves; no floor on
+        -- negative rates (MAR21.8, 21.41).
+
+    @invariant DrcStructure
+        -- JTD from LGD (senior 75%, non-senior 100%, covered bond 25%),
+        -- notional and P&L; maturity scaling with a three-month floor; netting
+        -- per obligor with seniority rules; hedge benefit ratio per bucket;
+        -- risk weights by credit quality; no hedging across buckets (MAR22).
+        -- For bonds, the issuer, seniority, recovery, notional and fair value
+        -- come from the valuation result's default-risk inputs (17,
+        -- DefaultRiskInputs), so no second valuation is made (D-046). For
+        -- an equity option the jump-to-default basis is the delta-adjusted
+        -- notional of the underlying, the delta being that of the prescribed
+        -- bumped nodes (D-054).
+
+    @invariant PerimeterMembership
+        -- A legal-entity perimeter contains the positions of that entity's
+        -- books; the consolidated perimeter contains every book, with
+        -- intra-group trades eliminated (D-039).
+
+    @invariant NoResidualRiskAddOn
+        -- v1 instruments carry no residual risk; RRAO (MAR23) is not
+        -- computed, and an instrument that would attract it is rejected
+        -- (D-039).
+
+    @invariant NodeGranularity
+        -- Coarse units (D-037, spec 07 JobGranularity): one sensitivity node
+        -- per position performs all of that position's revaluations (delta,
+        -- vega, curvature, every shocked object) in process; a shock or a
+        -- single revaluation is never a node. Shocked market objects are
+        -- nodes because they are shared by many positions. A new or amended
+        -- position recomputes only its own node and the aggregations above.
+
+    @invariant ResultShape
+        -- Per perimeter, as_of and scenario: charge per risk class and
+        -- measure (delta, vega, curvature), per bucket, per desk standalone,
+        -- DRC per bucket, and the total; every figure traceable to its
+        -- position sensitivities and parameters.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Who the capital is computed for: one legal entity in its regulator's
+-- currency, or the consolidated group (D-033, D-035). Defined in
+-- configuration; registered when a release activates.
+entity ReportingPerimeter {
+    name: String
+    scope: legal_entity | consolidated
+    reporting_currency: String
+    -- Which market-risk approach the perimeter uses, frtb (this spec) or
+    -- simplified (22); named in configuration (D-053).
+    approach: frtb | simplified
+    -- Reduced GIRR risk weights for specified currencies (MAR21.44) are a
+    -- bank option, recorded per perimeter.
+    reduced_girr_weights: Boolean
+    release: cfg/ConfigurationRelease
+    definition_hash: String
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RegisterReleasePerimeters {
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for d in release_perimeters(release):
+            PerimeterDefined(release: release, definition: d)
+}
+
+rule CreatePerimeter {
+    when: PerimeterDefined(release, definition)
+    requires: not exists ReportingPerimeter{definition_hash: perimeter_definition_hash(definition)}
+    ensures: ReportingPerimeter.created(
+        name: perimeter_name(definition),
+        scope: perimeter_scope(definition),
+        reporting_currency: perimeter_currency(definition),
+        approach: perimeter_approach(definition),
+        reduced_girr_weights: perimeter_reduced_weights(definition),
+        release: release,
+        definition_hash: perimeter_definition_hash(definition)
+    )
+}
+
+-- An FRTB run is an ordinary calculation request (02), usually from a batch
+-- schedule (06), whose planner (Julia) expands the graph described above.
+rule RequestFrtbCapital {
+    when: FrtbCapitalRequested(requester, perimeter, model, as_of, known_at?, origin_ref?)
+    requires: data/permitted(requester, "frtb.request", perimeter.name)
+    requires: perimeter.approach = frtb
+    ensures: graph/CalculationRequested(
+        requester: requester,
+        model: model,
+        subjects: perimeter_positions(perimeter, as_of),
+        data_class: perimeter_data_class(perimeter),
+        as_of: as_of,
+        known_at: known_at,
+        origin_ref: origin_ref
+    )
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor RiskController {
+    identified_by: data/User
+}
+
+actor FrtbWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface FrtbRequests {
+    facing controller: RiskController
+    context perimeter: ReportingPerimeter
+
+    exposes:
+        perimeter.name
+        perimeter.scope
+        perimeter.reporting_currency
+        perimeter.approach
+        perimeter.reduced_girr_weights
+
+    provides:
+        FrtbCapitalRequested(controller, perimeter, model, as_of, known_at?, origin_ref?)
+}
+
+surface FrtbComputation {
+    facing worker: FrtbWorker
+
+    contracts:
+        demands FrtbStandardisedApproach
+        demands graph/DeterministicComputation
+
+    @guarantee Traceability
+        -- Every reported charge can be decomposed down to the position
+        -- sensitivities, shocked objects and parameter versions that produced
+        -- it, through the calculation graph's provenance.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-039):
+--   - Formulas are taken from the official BCBS PDF; each formula and
+--     parameter records the PDF edition and paragraph it implements.
+--   - Each book belongs to one legal entity (04); a legal-entity perimeter
+--     holds its books; the consolidated perimeter holds all books with
+--     intra-group trades eliminated.
+--   - Delta uses central differences unless the PDF prescribes otherwise
+--     (to be confirmed when the formulas are transcribed).
+--   - RRAO (MAR23) is out of scope for v1.
+--   - One sensitivity node per position until measurements show a need to
+--     group small positions.
+--   - Reduced GIRR weights apply, set per perimeter (reduced_girr_weights).
+-- Before the parameter set is released (task, not a decision): transcribe
+-- curvature shock sizes (MAR21.98-21.101) and the CSR and equity risk-weight
+-- tables verbatim from the PDF.

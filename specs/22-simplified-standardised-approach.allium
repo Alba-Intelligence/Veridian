@@ -1,0 +1,316 @@
+-- allium: 3
+-- 22-simplified-standardised-approach.allium
+
+-- Scope: The CRR3 simplified standardised approach for market risk: own funds
+--   requirements for position risk in traded debt instruments and equities
+--   and for foreign exchange risk, for the v1 instruments (D-002, D-022),
+--   producing the figures of EBA templates C 18.01, C 21.01 and C 22.01
+--   (D-052).
+-- Includes: decomposition of positions into the approach's position types,
+--   maturity-based debt ladder, equity and foreign exchange net positions,
+--   non-delta risks of options, scaling to a risk exposure amount, the
+--   eligibility condition, reporting perimeters (reused from 11).
+-- Excludes:
+--   - The sensitivities-based method and the default risk charge: spec 11.
+--     A perimeter's capital is computed by one approach at a time, chosen in
+--     configuration (see open questions).
+--   - Securitisation and correlation trading specific risk (C 19.01, C 20.01)
+--     and commodities (C 23.01): no v1 instrument attracts them; a position
+--     that would is rejected, as for RRAO in 11.
+--   - Internal models (C 24.00): not used by the bank.
+--   - Report formats and submission: spec 19.
+-- Dependencies: 01, 02, 05, 08, 11 (perimeters). Valuations: 09, 17, 18.
+--
+-- Sources (F-3): CRR as amended by Regulation (EU) 2024/1623 (CRR3), the
+-- articles on the simplified standardised approach, and the template layouts
+-- extracted in docs/regulatory/eba-corep-market-risk/. Every parameter (time
+-- bands, zones, risk weights per band, disallowance factors, the scaling
+-- factor, the eligibility thresholds) is a configuration artefact citing its
+-- article and paragraph; formulas are implemented as prescribed. The article
+-- numbers and tables are transcribed verbatim from the regulation before the
+-- parameter set is released (a task, see open questions).
+--
+-- Computation as a graph (D-032), for one perimeter and as_of:
+--   base market objects (08) and valuation results (09, 17, 18)
+--   -> per-position decomposition node: turns the position into the approach's
+--      position types (see PositionDecomposition), in the perimeter's
+--      reporting currency
+--   -> per-risk-category aggregation: maturity ladder for debt, net positions
+--      for equity and foreign exchange, add-ons for options
+--   -> own funds requirement per category -> total -> risk exposure amount.
+-- Execution (D-037): same as 11; the graph distributes the nodes.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./11-frtb-sa.allium" as frtb
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract SimplifiedStandardisedApproach {
+    decompose: (position: data/InputVersion, valuation: String, base_objects: Set<String>, parameters_hash: String, reporting_currency: String) -> String
+    aggregate: (decompositions: Set<String>, own_funds: data/InputVersion, parameters_hash: String, reporting_currency: String) -> String
+    eligibility: (entity: String, as_of: Timestamp, own_funds: data/InputVersion, parameters_hash: String) -> String
+
+    @invariant ApproachSelection
+        -- A perimeter names its approach, frtb (11) or simplified (22), in
+        -- configuration (D-053). A run under one approach for a perimeter
+        -- that names the other is refused. A perimeter set to simplified
+        -- needs a passing eligibility result for the month of the run (see
+        -- EligibilityCondition); an ineligible entity is rejected, never
+        -- silently moved to the other approach. On an individual basis an
+        -- institution does not combine the simplified approach with either
+        -- of the others; at consolidated level the approaches may be
+        -- combined as long as the simplified approach is not combined with
+        -- another within a single legal entity (Article 325(4), CRR3 point
+        -- 156).
+
+    @invariant OwnFundsInput
+        -- The entity's own funds, needed by the foreign exchange threshold
+        -- and the eligibility test, arrive from the finance function as an
+        -- ordinary versioned input (01) per entity and reporting date, with
+        -- its source and signer recorded (D-053). A missing figure rejects
+        -- the run, naming the entity and the date; the version used is part
+        -- of the result.
+
+    @invariant IssuerAndMarketReferenceData
+        -- The specific risk category of a bond (Article 336, Table 1: the
+        -- risk weight class the issuer would receive under the standardised
+        -- approach for credit risk, 0 %, 20 % or 50 % or a qualifying item
+        -- as defined in 336(4), 100 %, 150 %) and the primary market of an
+        -- equity issuer come from the reference data
+        -- of 10, recorded on the issuer and versioned like other reference
+        -- data (D-053). All positions in an issuer fall in its primary
+        -- market, whichever line was traded. An issuer without the needed
+        -- category or primary market is a deterministic rejection naming the
+        -- issuer.
+
+    @invariant PositionDecomposition
+        -- Each position becomes positions of the approach's types, long or
+        -- short, in the reporting currency:
+        --   - bond: one debt position at the market value of the bond, in the
+        --     band of its residual maturity (coupon below or above the
+        --     threshold selects the band set, as C 18.01 shows), general
+        --     risk; plus specific risk by issuer category;
+        --   - interest rate swap (Article 330): two debt positions, one per
+        --     leg, opposite signs: a floating-rate position in the band of
+        --     the period until the next interest fixing and a fixed-rate
+        --     position with the maturity of the swap itself (C 18.01 row
+        --     "Derivatives"); sensitivity models (Article 331(1)) need
+        --     permission and are not used in v1; the value of each position
+        --     follows Article 327, to be confirmed on transcription;
+        --   - equity call option: an equity position equal to the delta times
+        --     the number of underlying shares (delta-equivalent), plus the
+        --     option's non-delta add-on;
+        --   - foreign currency cash or value: a foreign exchange position in
+        --     that currency.
+        -- The valuation result (09, 17, 18) is the single source of market
+        -- values; nothing is valued twice.
+
+    @invariant MaturityMethod
+        -- General risk by the maturity method of Article 339 (the duration
+        -- method of Article 340 is not used in v1): net positions (Article
+        -- 327) go to the bands of Table 2, by residual maturity for fixed
+        -- rates and by the period until the next rate setting for variable
+        -- rates, in the coupon column of 3 % or more or of less than 3 %;
+        -- each is weighted by the band's weighting; matched weighted
+        -- positions are formed within each band, within each zone, between
+        -- zones one and two and two and three (in either order, 339(6)),
+        -- and between zones one and three; the requirement is 10 % of the
+        -- matched weighted positions in all bands, 40 %, 30 % and 30 % of the
+        -- matched weighted positions in zones one, two and three, 40 % of
+        -- the matches between adjacent zones, 150 % of the match between
+        -- zones one and three and 100 % of the residual (339(9)). Specific
+        -- risk by Article 336 Table 1, summing weighted positions long or
+        -- short. The tables and percentages are configuration citing the
+        -- paragraph.
+
+    @invariant EquityAndFxPositions
+        -- Equity: per national market, gross (sum of absolute net positions
+        -- per issuer) for specific risk and net for general risk. Foreign
+        -- exchange (Article 351 as replaced by CRR3 point 193): when the sum
+        -- of the overall net foreign exchange position and the net gold
+        -- position (Article 352) exceeds 2 % of total own funds
+        -- (OwnFundsInput), the requirement is that sum in the reporting
+        -- currency multiplied by 8 %; otherwise there is none. The 2 % and
+        -- 8 % are configuration citing the article.
+
+    @invariant OptionsNonDeltaRisk
+        -- Article 329: an option is treated as a position equal to the value
+        -- of the underlying times its delta, which may be netted against
+        -- offsetting positions in the identical underlying. The delta is
+        -- that of the exchange; for OTC options, or where the exchange gives
+        -- none, the institution may calculate delta with a model subject to
+        -- the competent authority's permission, so the permission is
+        -- recorded in configuration and a run without it for an OTC option
+        -- is rejected. The delta, gamma and vega come from the prescribed
+        -- bumped nodes of 11, one source for both approaches, never from the
+        -- informational figures of 18 (D-032, D-053, D-054: the bumped-node
+        -- delta is used for all options, with the permission recorded for
+        -- OTC options). Other risks of options
+        -- must be adequately reflected (329(2)) by one of the methods of the
+        -- technical standards under 329(3), which C 18.01 shows as the
+        -- simplified method, the delta-plus method (gamma, vega,
+        -- non-continuous options) and the scenario matrix; the method is
+        -- named per entity in configuration.
+
+    @invariant EligibilityCondition
+        -- The approach may be used only while the size of the entity's on-
+        -- and off-balance-sheet business subject to market risk is equal to
+        -- or below each threshold of Article 325a(1), assessed monthly on
+        -- data as of the last day of the month (CRR3 point 157). The
+        -- assessment is recorded per entity and month, and a run uses the
+        -- assessment of its month; an entity above a threshold is rejected
+        -- with the threshold named, never silently computed with another
+        -- approach. The institution ceases to use the approach within three
+        -- months of the cases of Article 325a(5), and may start again only
+        -- after demonstrating to the competent authority that every
+        -- condition has held for an uninterrupted year (Article 325a(6)):
+        -- configuration records the cessation and the demonstration. The
+        -- thresholds of Article 325a(1) are 10 % of total assets and
+        -- EUR 500 million, both to be met; the trading book derogation of
+        -- Article 94(1) uses 5 % and EUR 50 million. Total assets come with
+        -- the own funds input (OwnFundsInput); the size is the absolute
+        -- long plus the absolute short aggregated position of 325a(2)(f).
+        -- The competent authority is notified when the approach starts or
+        -- ceases and immediately on a breach (325a(3), (4)).
+
+    @invariant ReportingCurrency
+        -- All figures of a perimeter are in that perimeter's reporting
+        -- currency (11, ReportingCurrency). The consolidated perimeter uses
+        -- one group FX snapshot at a configured fixing (09,
+        -- ConsolidationFxSnapshot, D-051). Intra-group trades are eliminated
+        -- (11, PerimeterMembership).
+
+    @invariant ScalingAndExposureAmount
+        -- Article 325(2) (CRR3 point 156): the position risk requirements of
+        -- Chapter 2 are multiplied by 1.3 for general and specific risk of
+        -- debt instruments other than securitisations, and by 3.5 for equity
+        -- instruments; the foreign exchange requirement of Chapter 3 by 1.2;
+        -- the commodity requirement of Chapter 4 by 1.9; the requirement for
+        -- securitisation instruments of Article 337 is added without a
+        -- multiplier. The risk exposure amount is 12.5 times the total (C
+        -- 18.01 columns "own funds requirements before application of
+        -- scaling factors" and "total risk exposure amount"). Both the
+        -- unscaled and the scaled figures are reported; the multipliers are
+        -- configuration citing the article.
+
+    @invariant UnsupportedFeatures
+        -- Positions of a kind the v1 instruments never produce
+        -- (securitisation, correlation trading, commodities, units of
+        -- collective investment undertakings under Article 348) are a
+        -- deterministic rejection naming the feature (D-039 pattern).
+
+    @invariant ResultShape
+        -- Per perimeter and as_of: for each of templates C 18.01, C 21.01 and
+        -- C 22.01, every cell the template defines (positions long and
+        -- short, net positions, positions subject to charge, own funds
+        -- requirement, risk exposure amount) keyed by the template's own row
+        -- and column codes (19); the eligibility result; per-position
+        -- decompositions; the own funds version used; the parameters_hash.
+        -- Every figure is traceable to
+        -- its position decompositions and the parameter versions.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A run is an ordinary calculation request (02), usually from a batch
+-- schedule (06), whose planner (Julia) expands the graph described above.
+rule RequestSsaCapital {
+    when: SsaCapitalRequested(requester, perimeter, model, as_of, known_at?, origin_ref?)
+    requires: data/permitted(requester, "ssa.request", perimeter.name)
+    requires: perimeter.approach = simplified
+    ensures: graph/CalculationRequested(
+        requester: requester,
+        model: model,
+        subjects: perimeter_positions(perimeter, as_of),
+        data_class: perimeter_data_class(perimeter),
+        as_of: as_of,
+        known_at: known_at,
+        origin_ref: origin_ref
+    )
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor SsaController {
+    identified_by: data/User
+}
+
+actor SsaWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface SsaRequests {
+    facing controller: SsaController
+    context perimeter: frtb/ReportingPerimeter
+
+    exposes:
+        perimeter.name
+        perimeter.scope
+        perimeter.reporting_currency
+        perimeter.approach
+
+    provides:
+        SsaCapitalRequested(controller, perimeter, model, as_of, known_at?, origin_ref?)
+}
+
+surface SsaComputation {
+    facing worker: SsaWorker
+
+    contracts:
+        demands SimplifiedStandardisedApproach
+        demands graph/DeterministicComputation
+
+    @guarantee Traceability
+        -- Every reported cell can be decomposed down to the position
+        -- decompositions, valuations and parameter versions that produced
+        -- it, through the calculation graph's provenance.
+
+    @guarantee GoldenCrossCheck
+        -- Golden worked examples (frozen positions, parameters and expected
+        -- template cells) are reproduced before a model version enters a
+        -- production release (21). No independent library implements this
+        -- approach, so the reference is a hand-checked example reviewed by
+        -- the model validator (D-050).
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-052): the simplified approach is specified here so that the
+-- worked example of 19 can be filled from Veridian's own results.
+-- Done 2026-11-16 (docs/regulatory/crr3-simplified-approach/): the amending
+-- provisions of CRR3 for Articles 94, 325, 325a, 337, 338, 348, 351, 352 are
+-- extracted verbatim. They give the multipliers (1.3, 3.5, 1.2, 1.9), the
+-- foreign exchange rule (2 % trigger, 8 %) and the monthly eligibility
+-- assessment. They do not restate the unamended articles.
+-- Done 2026-11-16 (docs/regulatory/crr-consolidated-simplified-approach/):
+-- Articles 94, 325, 325a, Chapter 2 (326-350) and Chapter 3 (351-354) of the
+-- consolidated CRR (26.06.2026) are extracted verbatim; the parameters named
+-- in this spec (Table 1 and Table 2 values, the 339(9) percentages, the 8 %
+-- of Articles 342, 343, 351, the thresholds) are read from them.
+open question "Parameters to turn into configuration artefacts with article and paragraph, from the extract: Article 336 Table 1, Article 339 Table 2 and paragraph 9, Articles 342, 343, 351 and 325a(1). A reviewer should check each value against the extract before release."
+open question "Technical standards the CRR points to and the extract does not contain: the definition of 'market' for equity net positions (Article 341(3)) and the methods for the other risks of options (Article 329(3)). To be transcribed from those standards before the options and equity parameters are released."
+-- Resolved (D-054): the bumped-node delta is used for all options, with the
+-- competent authority's permission under Article 329(1) recorded for OTC
+-- options; a run for an OTC option without it is rejected.
+open question "Does the bank hold, or will it seek, the Article 329(1) permission for its own delta model? Until it is recorded, OTC options are rejected under the simplified approach."
+open question "How the position value of swap legs is taken under Article 327 (to be confirmed on reading Articles 327 and 334)."
+-- Resolved (D-053): approach per perimeter is a configuration field, with
+-- eligibility required for simplified; option Greeks come from the prescribed
+-- bumped nodes of 11; own funds is a versioned input from finance; issuer
+-- category and an equity issuer's primary market come from reference data.
+open question "Whether the technical standards define the market of an equity position by the issuer's primary market, as chosen in D-053, or by another rule (see the open question on Article 341(3))."
+open question "Where the Article 325(2) multipliers enter the template: the EBA validation rules for C_18.00, C_21.00 and C_22.00 make the total risk exposure amount equal to 12.5 times the column the annex labels 'own funds requirements before application of scaling factors' (rules v0569_m, v0619_m, v0625_m, row 0010). Either the multipliers are applied before that column and the label means something else, or they are applied elsewhere. To be settled against the EBA reporting instructions before the templates are filled."

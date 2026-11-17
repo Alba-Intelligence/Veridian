@@ -1,0 +1,476 @@
+-- allium: 3
+-- 06-batch-scheduling.allium
+
+-- Scope: Automatic batch calculations on schedules defined in configuration
+--   (D-013, D-016, D-024, D-025).
+-- Includes: schedules from releases, run-time projection by Julia, scheduled
+--   runs pinned to their cut-off, completion, failure, deadlines and
+--   escalation, publication, reruns (reproduce or restate), re-planning when
+--   a calendar changes, review flags when data changes after the fact.
+-- Excludes:
+--   - Calendar arithmetic (03): Elixir only consumes projected instants.
+--   - What a run computes (planning and evaluation, 02; FRTB, later specs).
+--   - Notification channels: escalations are emitted events.
+-- Dependencies: 01, 02, 03 (via projection), 05.
+--
+-- Principles:
+--   - A run's knowledge time is its declared cut-off, not the moment it
+--     starts (D-016): a late start or a reproduction yields the same result.
+--   - A run acts as the schedule's service identity; the schedule's owner is
+--     a named person (D-016, D-026).
+--   - Regulatory results are published only from a completed run; there is
+--     no partial publication (D-016).
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- What a reviewer of a flagged run can decide (D-051): accept it as is (with
+-- a written reason), require a restatement (which then follows the
+-- restatement path with four-eyes, D-029), or escalate to risk control (the
+-- on-call rota, D-039).
+enum ReviewOutcome { accepted | restatement_required | escalated }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity BatchSchedule {
+    name: String
+    definition_hash: String
+    release: cfg/ConfigurationRelease
+    owner: data/User
+    run_as: data/User
+    model: graph/ModelVersion
+    data_class: data/DataClass
+    -- Calendars whose business days drive the run times; the projection is
+    -- recomputed whenever one of them changes (D-024).
+    calendars: Set<data/InputSeries>
+    local_cutoff: String
+    timezone: String
+    deadline_after: Duration
+    -- Hosts the run needs at its peak, from the release; 0 means the run
+    -- uses whatever capacity is already there (D-045).
+    peak_workers: Integer
+    status: active | withdrawn
+    next_run_at: Timestamp?
+    next_as_of: Timestamp?
+    -- The run instant for which capacity has been requested, so it is asked
+    -- for once per run.
+    capacity_requested_for: Timestamp?
+
+    transitions status {
+        active -> withdrawn
+        terminal: withdrawn
+    }
+}
+
+entity BatchRun {
+    run_ref: String
+    schedule: BatchSchedule
+    -- The knowledge time of the run's calculation request.
+    cutoff: Timestamp
+    as_of: Timestamp
+    started_at: Timestamp
+    deadline: Timestamp
+    requested_by: data/User
+    rerun_mode: original | reproduce | restate
+    rerun_of: BatchRun?
+    rerun_reason: String?
+    status: running | completed | failed
+    finished_at: Timestamp when status = completed | failed
+    review_flag: Boolean
+    review_reason: String?
+    -- Flagged runs are reviewed by the schedule owner within one business
+    -- day, i.e. before the schedule's next run instant (D-029).
+    review_due_at: Timestamp?
+    reviewed_by: data/User?
+    review_outcome: ReviewOutcome?
+    review_note: String?
+
+    transitions status {
+        running -> completed
+        running -> failed
+        terminal: completed, failed
+    }
+
+    publication: RunPublication with run = this
+
+    invariant RerunsPointBack {
+        rerun_mode != original implies rerun_of != null
+    }
+}
+
+-- A run's results as released to their consumers (e.g. regulatory reporting).
+entity RunPublication {
+    run: BatchRun
+    published_at: Timestamp
+    state: in_effect | replaced
+    replaced_at: Timestamp when state = replaced
+
+    transitions state {
+        in_effect -> replaced
+        terminal: replaced
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    late_start_tolerance: Duration = 15.minutes
+    -- How long before a run's cut-off its peak capacity is requested from the
+    -- grid (D-045). The spike measured 11-34 s for a higher-priority job to
+    -- take hosts, but a real grid queue can take far longer: this must
+    -- exceed the grid's usual wait, with margin.
+    capacity_lead: Duration = 1.hour
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Schedules come only from configuration releases (D-016).
+rule RegisterReleaseSchedules {
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for d in release_schedules(release):
+            ScheduleDefined(release: release, definition: d)
+        for old in schedules_absent_from(release):
+            ScheduleWithdrawn(schedule: old)
+}
+
+-- An unchanged definition carried into a new release keeps its schedule.
+rule CreateSchedule {
+    when: ScheduleDefined(release, definition)
+    requires: not exists BatchSchedule{definition_hash: schedule_definition_hash(definition)}
+    ensures: BatchSchedule.created(
+        name: schedule_name(definition),
+        definition_hash: schedule_definition_hash(definition),
+        release: release,
+        owner: schedule_owner(definition),
+        run_as: schedule_identity(definition),
+        model: schedule_model(definition),
+        data_class: schedule_data_class(definition),
+        calendars: schedule_calendars(definition),
+        local_cutoff: schedule_cutoff(definition),
+        timezone: schedule_timezone(definition),
+        deadline_after: schedule_deadline(definition),
+        peak_workers: schedule_peak_workers(definition),
+        status: active,
+        next_run_at: null,
+        next_as_of: null,
+        capacity_requested_for: null
+    )
+}
+
+rule WithdrawSchedule {
+    when: ScheduleWithdrawn(schedule)
+    requires: schedule.status = active
+    ensures:
+        schedule.status = withdrawn
+        schedule.next_run_at = null
+        schedule.next_as_of = null
+}
+
+-- Run instants and their as_of dates come from a Julia calculation
+-- (03 run_instants) over the schedule's calendar versions, requested through
+-- the calculation graph as the schedule's service identity.
+rule ProjectFirstRun {
+    when: schedule: BatchSchedule.created
+    requires: schedule.status = active
+    ensures:
+        schedule.next_run_at = projected_next_instant(schedule, now)
+        schedule.next_as_of = projected_next_as_of(schedule, now)
+}
+
+-- Unplanned closure or any calendar change (D-024): re-plan and tell people.
+rule ReprojectOnCalendarChange {
+    when: data/InputChanged(series, version)
+    ensures:
+        for s in BatchSchedules where status = active and series in calendars:
+            s.next_run_at = projected_next_instant(s, now)
+            s.next_as_of = projected_next_as_of(s, now)
+            ScheduleReprojected(schedule: s, cause: version)
+}
+
+-- Peak capacity is requested before the cut-off, not at it (D-045): the grid
+-- needs time to grant a batch of hosts (07, HostSupply), and the run's
+-- deadline must not include that wait. Asked once per run instant; a moved
+-- run instant (calendar change) is asked for again.
+rule RequestRunCapacity {
+    when: schedule: BatchSchedule.next_run_at - config.capacity_lead <= now
+    requires: schedule.status = active
+    requires: schedule.next_run_at != null
+    requires: schedule.peak_workers > 0
+    requires: schedule.capacity_requested_for != schedule.next_run_at
+    ensures:
+        schedule.capacity_requested_for = schedule.next_run_at
+        RunCapacityNeeded(
+            schedule: schedule,
+            workers: schedule.peak_workers,
+            needed_by: schedule.next_run_at
+        )
+}
+
+-- Also covers a cut-off missed while Veridian was down: the run starts as
+-- soon as possible with its original cut-off, and the owner is told (D-029).
+rule StartScheduledRun {
+    when: schedule: BatchSchedule.next_run_at <= now
+    requires: schedule.status = active
+    requires: schedule.next_run_at != null
+    requires: schedule.next_as_of != null
+    let ref = run_ref_of(schedule, schedule.next_run_at)
+    requires: not exists BatchRun{run_ref: ref}
+    ensures:
+        if schedule.next_run_at + config.late_start_tolerance < now:
+            LateRunStarted(schedule: schedule, cutoff: schedule.next_run_at, owner: schedule.owner)
+        BatchRun.created(
+            run_ref: ref,
+            schedule: schedule,
+            cutoff: schedule.next_run_at,
+            as_of: schedule.next_as_of,
+            started_at: now,
+            deadline: schedule.next_run_at + schedule.deadline_after,
+            requested_by: schedule.run_as,
+            rerun_mode: original,
+            rerun_of: null,
+            rerun_reason: null,
+            status: running,
+            review_flag: false,
+            review_reason: null,
+            review_due_at: null,
+            reviewed_by: null,
+            review_outcome: null,
+            review_note: null
+        )
+        graph/CalculationRequested(
+            requester: schedule.run_as,
+            model: schedule.model,
+            subjects: select_subjects(schedule, schedule.next_as_of, schedule.next_run_at),
+            data_class: schedule.data_class,
+            as_of: schedule.next_as_of,
+            known_at: schedule.next_run_at,
+            origin_ref: ref
+        )
+        schedule.next_run_at = projected_next_instant(schedule, schedule.next_run_at)
+        schedule.next_as_of = projected_next_as_of(schedule, schedule.next_run_at)
+}
+
+rule RunCompletes {
+    when: request: graph/CalculationRequest.status transitions_to fulfilled
+    let run = BatchRun{run_ref: request.origin_ref}
+    requires: exists run
+    requires: run.status = running
+    ensures:
+        run.status = completed
+        run.finished_at = now
+        RunReadyForPublication(run: run)
+}
+
+rule RunFails {
+    when: request: graph/CalculationRequest.status transitions_to unfulfilled
+    let run = BatchRun{run_ref: request.origin_ref}
+    requires: exists run
+    requires: run.status = running
+    ensures:
+        run.status = failed
+        run.finished_at = now
+        BatchRunFailed(run: run, owner: run.schedule.owner)
+}
+
+-- Publication of a complete run. A restatement replaces the publication of
+-- the run it restates. Consumers receive a publication only after its
+-- sign-off (13, D-038).
+rule PublishRun {
+    when: RunReadyForPublication(run)
+    requires: run.status = completed
+    requires: run.rerun_mode != restate
+    requires: not exists run.publication
+    ensures: RunPublication.created(run: run, published_at: now, state: in_effect)
+}
+
+-- A restatement replaces a publication that may already have been sent to a
+-- regulator: it needs a second person (D-029).
+rule RestatementAwaitsApproval {
+    when: RunReadyForPublication(run)
+    requires: run.status = completed
+    requires: run.rerun_mode = restate
+    ensures: RestatementApprovalRequested(run: run, owner: run.schedule.owner)
+}
+
+rule ApproveRestatement {
+    when: RestatementApproved(approver, run)
+    requires: run.status = completed
+    requires: run.rerun_mode = restate
+    requires: not exists run.publication
+    requires: approver != run.requested_by
+    requires: data/permitted(approver, "batch.approve_restatement", run.schedule.name)
+    requires: data/freshly_authenticated(approver)
+    ensures:
+        RunPublication.created(run: run, published_at: now, state: in_effect)
+        PublicationReplaced(previous: run.rerun_of)
+}
+
+rule ReplacePublication {
+    when: PublicationReplaced(previous)
+    requires: exists previous.publication
+    requires: previous.publication.state = in_effect
+    ensures:
+        previous.publication.state = replaced
+        previous.publication.replaced_at = now
+}
+
+rule DeadlineMissed {
+    when: run: BatchRun.deadline <= now
+    requires: run.status = running
+    ensures: BatchDeadlineMissed(run: run, owner: run.schedule.owner)
+}
+
+-- reproduce: same cut-off, proves the original result (audit, investigation).
+-- restate: cut-off now, includes corrections made since; its publication
+-- replaces the original's.
+rule RerunBatch {
+    when: RerunRequested(operator, run, mode, reason)
+    requires: run.status in {completed, failed}
+    requires: mode in {reproduce, restate}
+    requires: data/permitted(operator, "batch.rerun", run.schedule.name)
+    let cut = if mode = reproduce: run.cutoff else: now
+    let ref = rerun_ref_of(run, now)
+    ensures:
+        BatchRun.created(
+            run_ref: ref,
+            schedule: run.schedule,
+            cutoff: cut,
+            as_of: run.as_of,
+            started_at: now,
+            deadline: now + run.schedule.deadline_after,
+            requested_by: operator,
+            rerun_mode: mode,
+            rerun_of: run,
+            rerun_reason: reason,
+            status: running,
+            review_flag: false,
+            review_reason: null,
+            review_due_at: null,
+            reviewed_by: null,
+            review_outcome: null,
+            review_note: null
+        )
+        graph/CalculationRequested(
+            requester: operator,
+            model: run.schedule.model,
+            subjects: select_subjects(run.schedule, run.as_of, cut),
+            data_class: run.schedule.data_class,
+            as_of: run.as_of,
+            known_at: cut,
+            origin_ref: ref
+        )
+}
+
+-- Data recorded after a completed run's cut-off, effective at its as_of, for
+-- a series the run used: the run is flagged for review (D-025).
+rule FlagRunsAffectedByLateData {
+    when: data/InputChanged(series, version)
+    ensures:
+        for r in BatchRuns where status = completed and review_flag = false:
+            if run_used_series(r, series)
+                and effective_at(version, r.as_of)
+                and version.recorded_at > r.cutoff:
+                r.review_flag = true
+                r.review_reason = "input changed after cut-off"
+                r.review_due_at = projected_next_instant(r.schedule, now)
+                RunFlaggedForReview(run: r, cause: version, owner: r.schedule.owner)
+}
+
+rule ReviewFlaggedRun {
+    when: FlaggedRunReviewed(reviewer, run, outcome, note?)
+    requires: run.review_flag
+    requires: run.reviewed_by = null
+    requires: data/permitted(reviewer, "batch.review", run.schedule.name)
+    -- Accepting a flagged run as it is needs a written reason.
+    requires: outcome = accepted implies note != null
+    ensures:
+        run.reviewed_by = reviewer
+        run.review_outcome = outcome
+        run.review_note = note
+        if outcome = restatement_required:
+            RestatementRecommended(run: run, owner: run.schedule.owner)
+        if outcome = escalated:
+            FlaggedRunEscalatedToRiskControl(run: run, escalate_to: on_call_contact())
+}
+
+rule FlaggedRunReviewOverdue {
+    when: run: BatchRun.review_due_at <= now
+    requires: run.review_flag
+    requires: run.reviewed_by = null
+    ensures: FlaggedRunReviewEscalated(run: run, owner: run.schedule.owner)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor BatchOperator {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface BatchOperations {
+    facing operator: BatchOperator
+    context run: BatchRun
+
+    exposes:
+        run.schedule.name
+        run.as_of
+        run.cutoff
+        run.status
+        run.deadline
+        run.publication.state
+        run.review_flag
+        run.review_reason
+        run.rerun_mode
+
+    provides:
+        RerunRequested(operator, run, mode, reason) when run.status in {completed, failed}
+        RestatementApproved(operator, run) when run.rerun_mode = restate and run.status = completed
+        FlaggedRunReviewed(operator, run, outcome, note?) when run.review_flag
+
+    timeout:
+        DeadlineMissed
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- release_schedules, schedules_absent_from, schedule_* accessors: read from
+-- the release artefacts (05; schedule_peak_workers: hosts the run needs at
+-- its peak, consumed by 07 through RunCapacityNeeded). projected_next_instant / projected_next_as_of:
+-- read from the memoized run_instants calculation (03). select_subjects:
+-- the schedule's portfolio selector evaluated bitemporally at (as_of,
+-- cutoff). run_used_series, effective_at: provenance and range lookups.
+-- on_call_contact(): the on-call rota of risk control, in configuration
+-- (D-039). RestatementRecommended and FlaggedRunEscalatedToRiskControl are
+-- events for the console and alerts (12, 13); a recommended restatement is
+-- then requested as an ordinary rerun (RerunBatch) and approved by a second
+-- person.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-029): restatements need four-eyes before publication; missed
+-- runs start automatically with their original cut-off and notify the owner;
+-- no explicit dependencies between schedules in v1 (the graph suffices);
+-- flagged runs go to the schedule owner, due within one business day.
+-- Resolved (D-051): a reviewer may accept a flagged run as is (with a written
+-- reason), require a restatement, or escalate to risk control.

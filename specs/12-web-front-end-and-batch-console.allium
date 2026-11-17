@@ -1,0 +1,216 @@
+-- allium: 3
+-- 12-web-front-end-and-batch-console.allium
+
+-- Scope: The web front-end shared by every screen, and the batch operations
+--   console (D-038).
+-- Includes: front-end obligations (server-pushed views, generated forms,
+--   audited exports), the console's views of schedules, runs, progress,
+--   failed nodes and compute capacity, and its operational actions.
+-- Excludes:
+--   - Report sign-off, alerts and trends (13).
+--   - Trader dashboards (14).
+--   - Editing schedules: schedules are configuration as code (D-012); a
+--     change goes through a reviewed release (05). Drafting a release from a
+--     form is a later addition.
+-- Dependencies: 01, 02, 04, 05, 06, 07.
+--
+-- Technology (D-038): Phoenix LiveView served by the Elixir control plane;
+-- forms and field validation generated from the Julia schemas (D-018).
+-- Roles: batch operators run batches; risk controllers sign off reports (13).
+-- The two are distinct roles, so one person does not both produce and
+-- approve the same figures.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./06-batch-scheduling.allium" as batch
+use "./07-julia-workers.allium" as workers
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract WebFrontEnd {
+    render: (view_ref: String, user: data/User) -> String
+
+    @invariant ServerPushedViews
+        -- Views are rendered and kept current by the server (LiveView): a
+        -- state change in the ledger reaches every open view showing it,
+        -- without polling.
+
+    @invariant EntitledContentOnly
+        -- Every view shows only what permitted(user, action, target) allows
+        -- (D-026), evaluated on the server for each element; reads of
+        -- production and regulatory data are audited.
+
+    @invariant GeneratedForms
+        -- Forms for instruments, scenarios and parameters come from the
+        -- schemas generated from Julia types (D-018); the browser never holds
+        -- its own copy of domain rules.
+
+    @invariant FreshAuthenticationForApprovals
+        -- Every approval, sign-off or restatement asks for step-up
+        -- authentication (D-026).
+
+    @invariant DataClassVisible
+        -- Every figure on screen carries its data class; whatif and
+        -- non-production figures are visibly marked (D-038).
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A file a user took away. Audited as a read; the file names its data
+-- class, as_of, known_at and the user (D-038).
+entity DataExport {
+    requested_by: data/User
+    view_ref: String
+    format: csv | xlsx
+    data_class: data/DataClass
+    requested_at: Timestamp
+    content_hash: String
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule ExportView {
+    when: ExportRequested(user, view_ref, format)
+    requires: data/permitted(user, "data.export", view_ref)
+    ensures: DataExport.created(
+        requested_by: user,
+        view_ref: view_ref,
+        format: format,
+        data_class: view_data_class(view_ref),
+        requested_at: now,
+        content_hash: export_content_hash(view_ref, format, user)
+    )
+}
+
+-- Cancelling a running batch: its calculation request is cancelled (02) and
+-- the run then fails with reason "cancelled" (06).
+rule CancelBatchRun {
+    when: BatchCancellationRequested(operator, run)
+    requires: run.status = running
+    requires: data/permitted(operator, "batch.cancel", run.schedule.name)
+    let request = graph/CalculationRequest{origin_ref: run.run_ref}
+    requires: exists request
+    ensures: graph/RequestCancellationRequested(user: operator, request: request)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ConsoleUser {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ScheduleOverview {
+    facing operator: batch/BatchOperator
+    context schedule: batch/BatchSchedule
+
+    exposes:
+        schedule.name
+        schedule.status
+        schedule.owner
+        schedule.release.tag
+        schedule.next_run_at
+        schedule.next_as_of
+        schedule.data_class
+
+    contracts:
+        demands WebFrontEnd
+}
+
+-- One run: status, deadline, publication, review flag, and progress broken
+-- down by perimeter, book and risk class (nodes done, running, waiting,
+-- failed), with drill-down to failed nodes.
+surface RunMonitor {
+    facing operator: batch/BatchOperator
+    context run: batch/BatchRun
+
+    exposes:
+        run.run_ref
+        run.schedule.name
+        run.as_of
+        run.cutoff
+        run.started_at
+        run.deadline
+        run.status
+        run.rerun_mode
+        run.review_flag
+        run.review_reason
+        run.publication.state
+        run_progress(run)
+
+    provides:
+        BatchCancellationRequested(operator, run) when run.status = running
+        batch/RerunRequested(operator, run, mode, reason) when run.status in {completed, failed}
+        batch/RestatementApproved(operator, run) when run.rerun_mode = restate and run.status = completed
+        batch/FlaggedRunReviewed(operator, run, outcome) when run.review_flag
+        ExportRequested(operator, view_ref, format)
+
+    contracts:
+        demands WebFrontEnd
+}
+
+-- Why a node failed: inputs, attempts, reason, and the worker that ran it.
+surface FailedNodeDetail {
+    facing operator: batch/BatchOperator
+    context node: graph/CalculationNode where status = failed
+
+    exposes:
+        node.calc_id
+        node.model.function_name
+        node.model.version
+        node.as_of
+        node.inputs
+        node.attempts
+        node.failure_reason
+        node.failed_at
+
+    contracts:
+        demands WebFrontEnd
+}
+
+-- Compute capacity: hosts, their allocations and workers (07).
+surface CapacityMonitor {
+    facing operator: batch/BatchOperator
+    context host: workers/ComputeHost
+
+    exposes:
+        host.node_name
+        host.presence
+        -- When the control plane last heard from the host (D-045): a stale
+        -- value shows a host about to be declared lost.
+        host.last_heartbeat
+        host.max_workers
+        host.live_workers.count
+        host.walltime_ends_at
+        host.allocation.state
+
+    contracts:
+        demands WebFrontEnd
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- run_progress(run): counts of the run's planned steps by status, grouped by
+-- the plan's perimeter, book and risk class labels (from the Julia plan).
+-- view_data_class, export_content_hash: the exported view's class and the
+-- hash of the produced file.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-039): the console stays read-only for configuration in v1;
+-- drafting a release from a form is a later addition.

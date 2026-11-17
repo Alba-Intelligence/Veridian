@@ -1,0 +1,255 @@
+-- allium: 3
+-- 05-configuration-release.allium
+
+-- Scope: Configuration as code (D-012, D-016). Everything that is not data
+--   reaches Veridian only inside a tagged, reviewed, content-hashed release.
+-- Includes: release intake, verification, activation, supersession, refusal;
+--   development versus production releases; four-eyes through code review.
+-- Configuration covers: Julia code and model versions, generated schemas
+--   (D-018), planners, curve recipes, FRTB parameters, role-to-rights
+--   mapping, batch schedules, retention settings.
+-- Excludes:
+--   - Data (trades, market data, calendars, reference data): bitemporal
+--     inputs, 01-bitemporal-data.allium.
+--   - The repository, review tool and CI pipeline themselves; this spec sees
+--     only their evidence (black box verify_release).
+-- Dependencies: 01-bitemporal-data.allium (User, permitted).
+--
+-- There is no runtime editing of configuration. A configuration change is a
+-- new release. Only the content hashes of the configuration artefacts a
+-- calculation actually uses (its model code, the parameter sets it reads)
+-- enter its calc_id, never the whole release hash: a change to an FRTB risk
+-- weight yields new calc_ids only for nodes reading that weight, and
+-- everything else keeps reusing results across releases.
+
+use "./01-bitemporal-data.allium" as data
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- development: usable only with test and synthetic data, no review needed.
+-- production: usable with all data classes, needs independent review.
+enum ReleaseKind { development | production }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity ConfigurationRelease {
+    tag: String
+    commit_hash: String
+    content_hash: String
+    kind: ReleaseKind
+    authored_by: data/User
+    -- People whose approving reviews are recorded on the merged change.
+    reviewed_by: Set<data/User>
+    received_at: Timestamp
+    received_via: data/User
+    -- Optional scheduled activation, e.g. after the EOD batch (D-029).
+    activate_at: Timestamp?
+    status: received | active | superseded | refused | expired
+
+    activated_at: Timestamp when status = active | superseded
+    superseded_at: Timestamp when status = superseded
+    refusal_reason: String when status = refused
+
+    transitions status {
+        received -> active
+        received -> refused
+        received -> expired
+        active -> superseded
+        terminal: superseded, refused, expired
+    }
+
+    invariant ProductionReleasesAreReviewed {
+        -- model: release_gate.reviewedProduction
+        kind = production and status in {active, superseded}
+            implies reviewed_by.count >= 1 and not (authored_by in reviewed_by)
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How long after its activation time a scheduled release that has not
+    -- been activated is kept before it expires (D-051).
+    scheduled_release_expiry: Duration = 7.days
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- The release loader (a service identity) hands over a tagged release with
+-- the review evidence collected by the review tool.
+rule ReceiveRelease {
+    -- model: release_gate.submit
+    when: ReleaseSubmitted(loader, tag, commit_hash, content_hash, kind, author, reviewers, activate_at?)
+    requires: permitted(loader, "release.submit", kind)
+    requires: not exists ConfigurationRelease{tag: tag}
+    ensures: ConfigurationRelease.created(
+        tag: tag,
+        commit_hash: commit_hash,
+        content_hash: content_hash,
+        kind: kind,
+        authored_by: author,
+        reviewed_by: reviewers,
+        received_at: now,
+        received_via: loader,
+        activate_at: activate_at,
+        status: received
+    )
+}
+
+-- A verified release with a scheduled activation waits in received.
+rule ActivateScheduledRelease {
+    when: release: ConfigurationRelease.activate_at <= now
+    requires: release.status = received
+    requires: verify_release(release)
+    requires: release.kind = production implies
+        (release.reviewed_by.count >= 1 and not (release.authored_by in release.reviewed_by))
+    -- Model risk (21, D-050, D-058): every model version the release adds or
+    -- changes is validated.
+    requires: release.kind = production implies models_cleared(release)
+    ensures:
+        release.status = active
+        release.activated_at = now
+        ReleaseActivated(release: release, previous: active_release(release.kind))
+}
+
+-- A scheduled production release whose models are still not validated when
+-- its time comes is refused, not left waiting.
+rule RefuseScheduledRelease {
+    when: release: ConfigurationRelease.activate_at <= now
+    requires: release.status = received
+    requires: release.kind = production
+    requires: not models_cleared(release)
+    ensures:
+        release.status = refused
+        release.refusal_reason = "a model in the release has no current validation or has an open benchmark breach (21)"
+}
+
+-- A scheduled release that could not be activated (its verification failed
+-- or its time came and it was not activated) does not wait indefinitely: a
+-- review done long ago must not activate against models or calendars that
+-- have changed since. It expires and must be submitted again (D-051).
+rule ExpireScheduledRelease {
+    when: release: ConfigurationRelease.activate_at + config.scheduled_release_expiry <= now
+    requires: release.status = received
+    ensures: release.status = expired
+}
+
+-- Verification: the tag is signed, the content hash matches the artefacts,
+-- the golden test suite passed in CI (including calendar test vectors, 03),
+-- and, for production, at least one reviewer other than the author approved.
+rule ActivateRelease {
+    -- model: release_gate.activate
+    when: release: ConfigurationRelease.created
+    requires: release.status = received
+    requires: release.activate_at = null
+    requires: verify_release(release)
+    requires: release.kind = production implies
+        (release.reviewed_by.count >= 1 and not (release.authored_by in release.reviewed_by))
+    requires: release.kind = production implies models_cleared(release)
+    ensures:
+        release.status = active
+        release.activated_at = now
+        ReleaseActivated(release: release, previous: active_release(release.kind))
+}
+
+rule RefuseRelease {
+    -- model: release_gate.refuse release_gate.noGateRefusalWithoutChange
+    when: release: ConfigurationRelease.created
+    requires: release.status = received
+    requires: not verify_release(release)
+        or (release.kind = production
+            and (release.reviewed_by.count = 0 or release.authored_by in release.reviewed_by))
+        or (release.kind = production and release.activate_at = null
+            and not models_cleared(release))
+    ensures:
+        release.status = refused
+        release.refusal_reason = refusal_reason_of(release)
+}
+
+-- Exactly one active release per kind; activation and supersession share
+-- one instant.
+rule SupersedePreviousRelease {
+    -- model: release_gate.activate
+    when: ReleaseActivated(release, previous)
+    requires: previous != null
+    requires: previous.status = active
+    requires: previous != release
+    ensures:
+        previous.status = superseded
+        previous.superseded_at = release.activated_at
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant OneActiveReleasePerKind {
+    -- model: release_gate.oneActive
+    for a in ConfigurationReleases:
+        for b in ConfigurationReleases:
+            a != b and a.kind = b.kind and a.status = active
+                implies b.status != active
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ReleaseLoader {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ReleaseIntake {
+    facing loader: ReleaseLoader
+    context release: ConfigurationRelease
+
+    exposes:
+        release.tag
+        release.status
+        release.refusal_reason when release.status = refused
+
+    provides:
+        ReleaseSubmitted(loader, tag, commit_hash, content_hash, kind, author, reviewers, activate_at?)
+
+    @guarantee NoRuntimeConfiguration
+        -- No surface anywhere in Veridian changes configuration; only a new
+        -- release does.
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- verify_release(release), refusal_reason_of(release), active_release(kind)
+-- (the currently active release of that kind, or null): black boxes.
+-- release_models(release), release_schedules(release): contents read from
+-- the release artefacts by the specs that need them (02, 06).
+-- models_cleared(release): spec 21's gate, true when every model version the
+-- release adds or changes (graph model version, D-060), compared with the
+-- active release of that kind, has
+-- a current independent validation and no open benchmark breach. A release
+-- that changes no model passes it whatever the state of any validation (D-058).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-029): rollback is a new, reviewed release with the old content
+-- and a new tag; scheduled activation via activate_at; development and
+-- production run as separate Veridian instances, and release kinds remain as
+-- a safety net inside each instance.
+-- Resolved (D-051): a scheduled release that is not activated within seven
+-- days (configuration) of its activation time expires and must be submitted
+-- again.

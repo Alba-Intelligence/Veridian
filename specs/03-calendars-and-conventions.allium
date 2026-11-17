@@ -1,0 +1,153 @@
+-- allium: 3
+-- 03-calendars-and-conventions.allium
+
+-- Scope: Business-day calendars and date conventions, owned entirely by Julia
+--   (D-024). Elixir never interprets a calendar.
+-- Includes: the contract Julia fulfils for calendar arithmetic, schedule
+--   generation and day counts; calendar data rules; run-date projection for
+--   batch schedules; golden test vectors.
+-- Excludes:
+--   - Storage and versioning of calendar data (generic input series,
+--     01-bitemporal-data.allium; schema_ref "veridian.calendar/<n>").
+--   - Batch scheduling itself (later spec): it consumes run instants computed
+--     here and subscribes to data/InputChanged for the calendars used.
+--   - Instrument terms: each trade's payload names its conventions; pricing
+--     specs apply them.
+-- Dependencies: 01-bitemporal-data.allium, 02-calculation-graph.allium.
+--
+-- v1 calendars (D-019, D-020): London, New York, Paris, Hong Kong, TARGET,
+--   US government securities (SOFR).
+-- Calendar data (D-024): a calendar version lists holiday dates and the
+--   weekend days, for an effective period. Development data is generated from
+--   rules; production data comes from a vendor feed. Both are submitted as
+--   ordinary input versions, so every change is dated, attributed and audited.
+-- Unplanned closures (typhoon signal 8, black rainstorm): recorded as a
+--   same-day succession of the calendar (D-023). The resulting InputChanged
+--   re-plans affected scheduled runs; operators are notified.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- Every operation takes calendar versions (resolved bitemporally by the
+-- graph), never calendar names, so results are reproducible and the
+-- calendars' content hashes are part of every calc_id that uses them.
+contract BusinessDayCalendar {
+    is_business_day: (calendars: Set<data/InputVersion>, date: Timestamp) -> Boolean
+    adjust: (date: Timestamp, convention: String, calendars: Set<data/InputVersion>) -> Timestamp
+    advance: (date: Timestamp, tenor: String, convention: String, end_of_month: Boolean, calendars: Set<data/InputVersion>) -> Timestamp
+    schedule: (start: Timestamp, maturity: Timestamp, frequency: String, convention: String, roll: String, stub: String, calendars: Set<data/InputVersion>) -> List<Timestamp>
+    year_fraction: (start: Timestamp, finish: Timestamp, day_count: String, context: String) -> String
+    run_instants: (calendars: Set<data/InputVersion>, local_cutoff: String, timezone: String, from: Timestamp, to: Timestamp) -> List<Timestamp>
+
+    @invariant JointCalendar
+        -- A date is a business day for a set of calendars only if it is a
+        -- business day in every member (joint calendar, e.g. London+New York
+        -- for a USD/GBP cross-currency leg).
+
+    @invariant WeekendIsData
+        -- Weekend days come from each calendar version's data, never from
+        -- code. v1 calendars all use Saturday and Sunday.
+
+    @invariant PartialDays
+        -- Calendar data classifies each date as full, partial (with a local
+        -- close time) or closed (D-025). Whether a partial day counts as a
+        -- business day is decided by the convention in use, never assumed;
+        -- run_instants moves a cut-off earlier than an early close.
+
+    @invariant DefinitionsEdition
+        -- Convention identifiers carry their ISDA edition (2006 Definitions
+        -- or 2021 Interest Rate Derivatives Definitions); an identifier
+        -- without an edition means 2021 (D-025). Both editions are supported.
+
+    @invariant PrescribedFormulas
+        -- Where ISDA or a regulator prescribes a formula (approximation,
+        -- intermediate rounding, interpolation), the prescribed formula is
+        -- implemented exactly even if not mathematically exact, and cites its
+        -- source document, edition and paragraph (F-3).
+
+    @invariant BusinessDayConventions
+        -- Supported adjustments: unadjusted, following, modified_following,
+        -- preceding, modified_preceding (ISDA definitions). Unknown
+        -- conventions are a deterministic rejection, never a default.
+
+    @invariant RollsAndStubs
+        -- Rolls: day-of-month, end_of_month, imm (third Wednesday). Stubs:
+        -- short or long, front or back. Schedules are generated backwards from
+        -- maturity unless the stub says otherwise.
+
+    @invariant ExactYearFractions
+        -- year_fraction returns an exact rational "numerator/denominator"
+        -- (D-015): act_360, act_365_fixed, act_act_isda, act_act_icma,
+        -- thirty_360, thirty_e_360, thirty_e_360_isda, bus_252. context
+        -- carries what a convention needs (ICMA: coupon period; bus_252:
+        -- calendar; 30E/360 ISDA: maturity date). Never rounded.
+
+    @invariant RunInstants
+        -- run_instants returns, for each business day in [from, to), the UTC
+        -- instant of local_cutoff in timezone on that day. Daylight-saving
+        -- transitions are resolved from the timezone database version, which
+        -- is itself a pinned input.
+
+    @guidance
+        -- Logic may build on BusinessDays.jl (calendars, joint calendars) and
+        -- DayCounts.jl, extended where they fall short (bus_252, imm rolls,
+        -- stubs). Generic pieces are candidates for upstream contribution
+        -- (D-011). Holiday rules in those packages only generate development
+        -- data; they are never consulted at calculation time.
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How far ahead run instants are projected for batch schedules.
+    run_projection_horizon: Duration = 90.days
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Golden test vectors are golden-class input series like any other
+-- (schema_ref "veridian.calendar_test_vector/<n>"). Every release of the
+-- Julia calendar code must reproduce all of them exactly; a mismatch blocks
+-- the model version's approval (02-calculation-graph, PromoteModelVersion).
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor CalendarWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface CalendarComputation {
+    facing worker: CalendarWorker
+
+    contracts:
+        demands BusinessDayCalendar
+        demands graph/DeterministicComputation
+
+    @guarantee CalendarsOnlyThroughVersions
+        -- A worker computes with the calendar versions it is given and with
+        -- nothing else: no embedded holiday tables, no system clock.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-025): partial days are representable and their treatment is a
+-- convention; both ISDA editions, default 2021; retroactive closures flag
+-- completed runs for review (specified with batch scheduling).
+open question "Which vendor for production holiday data, and who in the bank owns calendar data quality? (TBD)"
+open question "Per convention: does a partial day count as a business day for payment, for fixing, and for accrual? Needs a table per v1 currency."

@@ -1,0 +1,113 @@
+-- allium: 3
+-- 09-irs-pricing.allium
+
+-- Scope: Valuation of vanilla single-currency interest rate swaps (D-002,
+--   D-022): fixed against floating, the floating leg on an overnight rate
+--   compounded in arrears or on a term rate.
+-- Includes: what a valuation needs, what it must return, how life-cycle
+--   events and fixings are handled, how the planner expands an IRS request.
+-- Excludes:
+--   - The trade payload fields: generated from the Julia types (D-018).
+--   - Curves (08), calendars and conventions (03), sensitivities and FRTB
+--     (later spec, see F-2).
+-- Dependencies: 01, 02, 03, 08.
+--
+-- Planning (D-020), one pass, for one IRS trade version:
+--   calendars named by the trade (03) -> discount curve (08) -> forwarding
+--   curve of the index (08, prerequisite: discount curve) -> valuation node
+--   (this spec), with the fixings series of the index as input.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract IrsValuation {
+    value: (trade: data/InputVersion, as_of: Timestamp, discount_curve: String, forwarding_curve: String, fixings: Set<data/InputVersion>, calendars: Set<data/InputVersion>, reporting_currencies: Set<String>, fx: Set<String>) -> String
+
+    @invariant ScheduleFromTerms
+        -- Both legs' schedules come from the trade terms via the calendar
+        -- contract (03): dates, adjustments, rolls, stubs, payment lags.
+
+    @invariant OvernightCompounding
+        -- Overnight-index legs compound daily in arrears per the 2021 ISDA
+        -- Definitions by default (D-025), including lookback, observation
+        -- shift and lockout when the trade terms state them; the formula is
+        -- the prescribed one, with its prescribed rounding (F-3).
+
+    @invariant SeasonedTradesUseFixings
+        -- Coupons whose rate is already observable at as_of use published
+        -- fixings, never curve projections. A missing past fixing is a
+        -- deterministic rejection naming the index and date (see open
+        -- question on proxies).
+
+    @invariant LifeCycleThroughSuccession
+        -- Early termination, partial termination (notional reduction),
+        -- novation and amendment arrive as successions of the trade (D-023);
+        -- the valuation always uses the trade version effective at as_of.
+
+    @invariant ResultShape
+        -- The valuation result contains (D-033): PV per leg and in total in
+        -- local currency (the trade currency) and in each requested reporting
+        -- currency, with the FX object used; the cashflow table per leg
+        -- (accrual start and end, payment date, notional, year fraction as
+        -- exact rational, fixed rate or projected or fixed floating rate,
+        -- discount factor, PV in local currency); accrued interest; the par
+        -- rate. Cashflows paying on as_of are included ("for value").
+
+    @invariant ConsolidationFxSnapshot
+        -- A PV or figure converted to the group's consolidated reporting
+        -- currency uses one FX snapshot for the whole group, taken at a
+        -- fixing named in configuration (for example the ECB reference rates
+        -- at 16:00 CET), so every legal entity is converted at the same
+        -- moment and the consolidated figure is reproducible (D-051). A PV in
+        -- an entity's own regulator currency uses the end-of-day rates of
+        -- that currency (D-035). The FX object used is named in the result.
+        -- The same rule applies to bonds (17) and options (18).
+
+    @invariant PlainVanillaOnly
+        -- v1 (D-033): constant notional, spot-starting, no spread over the
+        -- floating index, standard stubs, overnight indices only (D-034).
+        -- Other terms are a deterministic rejection naming the feature.
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor PricingWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface IrsValuationComputation {
+    facing worker: PricingWorker
+
+    contracts:
+        demands IrsValuation
+        demands graph/DeterministicComputation
+
+    @guarantee GoldenCrossCheck
+        -- Golden IRS valuations are reproduced independently (QuantLib,
+        -- D-010) within a stated tolerance before a model version can enter a
+        -- production release.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-033): local + reporting currencies; cashflows on as_of
+-- included; plain vanilla only.
+-- Resolved (D-035): clean and dirty PV both reported (dirty = clean +
+-- accrued); a missing past fixing rejects the valuation in v1 (no proxy);
+-- valuation at end of day per currency, matching batch cut-offs; reporting
+-- currencies configured per legal entity (its regulators) plus the group's
+-- consolidated reporting currency.
+-- Resolved (D-051): consolidation uses one group FX snapshot at a configured
+-- fixing; entities' own regulator currencies use their end-of-day rates.

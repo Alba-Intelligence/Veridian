@@ -1,0 +1,541 @@
+-- allium: 3
+-- 01-bitemporal-data.allium
+
+-- Scope: Bitemporal, immutable, versioned inputs to every Veridian calculation
+--   (trades, market quotes, curve definitions, model configuration, reference data).
+-- Includes: input series, immutable versions, effective (valid) time, record
+--   (knowledge) time, corrections with four-eyes approval, data classes
+--   (production, golden, synthetic, test), point-in-time resolution.
+-- Excludes:
+--   - Identity, roles and rights (03-identity-access.allium); referenced here
+--     through the black box permitted(user, action, target).
+--   - Audit log mechanics (03-identity-access.allium). Every rule here is an
+--     auditable event.
+--   - Payload formats and storage (content is identified by content_hash only).
+-- Dependencies: none.
+--
+-- Three times per version, as required:
+--   submitted_at  when the version entered the system (creation)
+--   recorded_at   when it became authoritative knowledge (update / correction)
+--   effective_from/effective_to   the period it describes (date of use)
+-- Data may be recorded now and become effective later, or be corrected later
+-- for a period in the past. Nothing is ever mutated in place.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Identified user with specific access rights. Defined in 03-identity-access.
+external entity User {}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Calculations never mix data classes (see 02-calculation-graph), with one
+-- one-way exception: whatif (D-038) holds a trader's hypothetical trades and
+-- market shifts, private to their author; a whatif calculation may read
+-- production inputs, but nothing outside whatif ever reads a whatif input.
+enum DataClass { production | golden | synthetic | test | whatif }
+
+-- How a version came to exist:
+--   original    first statement for its period (RecordInputVersion)
+--   correction  fixes an error, four-eyes (D-006, D-007)
+--   succession  a new business fact from a date: exercise, issuer call,
+--               default, corporate action, amendment (D-023)
+--   remainder   the uncovered part of a replaced version (D-006)
+enum VersionOrigin { original | correction | succession | remainder }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A logical input whose value changes over time, e.g. "trade IRS-000042",
+-- "EUR ESTR OIS par quotes", "issuer ACME ratings", "calendar TARGET".
+-- The platform is instrument-agnostic (D-018): what a payload means is given
+-- only by schema_ref, a schema generated from Julia types and shipped in a
+-- tagged release. Calendars are such series (D-017): holidays are announced
+-- and corrected over time, and one calendar version serves both planes.
+entity InputSeries {
+    key: String
+    schema_ref: String
+    data_class: DataClass
+    created_at: Timestamp
+    created_by: User
+
+    versions: InputVersion with series = this
+    active_versions: versions where status = active
+}
+
+-- One immutable statement about a series over an effective period.
+entity InputVersion {
+    series: InputSeries
+    content_hash: String
+    effective_from: Timestamp
+    effective_to: Timestamp?
+    submitted_by: User
+    submitted_at: Timestamp
+    supersedes: InputVersion?
+    -- Set on a remainder created when a partial correction splits a version
+    -- (D-006): same content as carried_from, narrower effective range.
+    carried_from: InputVersion?
+    origin: VersionOrigin
+    -- Where the content came from (D-035): data source and retrieval
+    -- reference for ingested data, generator and seed for synthetic data,
+    -- absent for manual entry. Used for attribution and lineage.
+    lineage_ref: String?
+
+    status: proposed | active | superseded | rejected
+
+    recorded_at: Timestamp when status = active | superseded
+    approved_by: User? when status = active | superseded
+    superseded_at: Timestamp when status = superseded
+    -- Absent when the platform rejected a stale correction itself (D-051).
+    rejected_by: User? when status = rejected
+    rejection_reason: String when status = rejected
+
+    transitions status {
+        proposed -> active
+        proposed -> rejected
+        active -> superseded
+        terminal: superseded, rejected
+    }
+
+    is_correction: origin = correction
+
+    invariant EffectiveRangeOrdered {
+        effective_to = null or effective_to > effective_from
+    }
+
+    invariant OnlyCorrectionsAwaitApproval {
+        status = proposed implies origin = correction
+    }
+}
+
+-- Many corrections reviewed and approved in one action (D-051): fixing a week
+-- of curves at once. Each member stays an ordinary correction with one target,
+-- one lineage and its own approval record; the batch only groups the review.
+-- It is approved or rejected as a whole.
+entity CorrectionBatch {
+    submitted_by: User
+    submitted_at: Timestamp
+    corrections: Set<InputVersion>
+    approved_by: User? when status = approved
+    rejection_reason: String when status = declined
+    status: awaiting_review | approved | declined
+
+    transitions status {
+        awaiting_review -> approved
+        awaiting_review -> declined
+        terminal: approved, declined
+    }
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract InputRetention {
+    @invariant NeverPurgedWhileDepended
+        -- An input version is never purged while any retained result or any
+        -- reported figure depends on it (D-051). Reported figures are kept
+        -- for their own retention class (13, 10 years) and drill-down
+        -- recomputes purged payloads from inputs (02), so input retention
+        -- follows the longest dependent figure. Retention is configuration
+        -- (D-005); a setting that would purge a depended-on version is
+        -- refused when the release is verified.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RegisterInputSeries {
+    when: InputSeriesRegistered(creator, key, schema_ref, data_class)
+    requires: permitted(creator, "input.register", data_class)
+    requires: not exists InputSeries{key: key}
+    ensures: InputSeries.created(
+        key: key,
+        schema_ref: schema_ref,
+        data_class: data_class,
+        created_at: now,
+        created_by: creator
+    )
+}
+
+-- A new (non-correcting) version becomes authoritative on receipt.
+rule RecordInputVersion {
+    when: InputVersionSubmitted(submitter, series, content_hash, effective_from, effective_to?, lineage_ref?)
+    requires: permitted(submitter, "input.record", series)
+    requires: not overlaps_active(series, effective_from, effective_to)
+    ensures: InputVersion.created(
+        series: series,
+        content_hash: content_hash,
+        effective_from: effective_from,
+        effective_to: effective_to,
+        submitted_by: submitter,
+        submitted_at: now,
+        supersedes: null,
+        origin: original,
+        lineage_ref: lineage_ref,
+        carried_from: null,
+        status: active,
+        recorded_at: now,
+        approved_by: null
+    )
+}
+
+-- A correction replaces all or part of an active version; it waits for a
+-- second person. Golden data is corrected exactly like production (D-007).
+-- Its effective range must lie within the target's range (D-006).
+rule ProposeCorrection {
+    when: CorrectionProposed(submitter, target, content_hash, effective_from, effective_to?)
+    requires: target.status = active
+    requires: permitted(submitter, "input.correct", target.series)
+    requires: effective_from >= target.effective_from
+    requires: target.effective_to = null
+        or (effective_to != null and effective_to <= target.effective_to)
+    ensures: InputVersion.created(
+        series: target.series,
+        content_hash: content_hash,
+        effective_from: effective_from,
+        effective_to: effective_to,
+        submitted_by: submitter,
+        submitted_at: now,
+        supersedes: target,
+        origin: correction,
+        carried_from: null,
+        status: proposed
+    )
+}
+
+rule ApproveCorrection {
+    when: CorrectionApproved(approver, correction)
+    requires: correction.status = proposed
+    requires: correction.supersedes != null
+    requires: correction.supersedes.status = active
+    requires: approver != correction.submitted_by
+    requires: permitted(approver, "input.approve_correction", correction.series)
+    requires: freshly_authenticated(approver)
+    ensures:
+        correction.status = active
+        correction.recorded_at = now
+        correction.approved_by = approver
+        VersionReplaced(replacement: correction, previous: correction.supersedes)
+}
+
+-- Activation and supersession share one knowledge instant, so no point in
+-- record time sees both or neither as authoritative.
+-- Partial correction (D-006): the parts of the previous range not covered by
+-- the correction stay authoritative as remainder versions with the previous
+-- content_hash, so calculations over those dates keep their calc_ids.
+--
+-- Worked example (golden USD swap curve, D-007):
+--   v1 recorded 2011-11-01, effective [2011-11-01, open), content A.
+--   Correction recorded (approved) 2011-11-03, effective [2011-11-04, open),
+--   content B.
+--   After approval: v1 superseded at 2011-11-03; remainder r1 effective
+--   [2011-11-01, 2011-11-04) content A; correction effective
+--   [2011-11-04, open) content B.
+--   resolve(as_of 2011-11-05, known_at 2011-11-02) = v1 (A)
+--   resolve(as_of 2011-11-02, known_at 2011-11-13) = r1 (A, same calc_ids)
+--   resolve(as_of 2011-11-05, known_at 2011-11-13) = correction (B)
+rule SupersedePreviousVersion {
+    when: VersionReplaced(replacement, previous)
+    requires: previous.status = active
+    requires: replacement.status = active
+    ensures:
+        previous.status = superseded
+        previous.superseded_at = replacement.recorded_at
+        if replacement.effective_from > previous.effective_from:
+            InputVersion.created(
+                series: previous.series,
+                content_hash: previous.content_hash,
+                effective_from: previous.effective_from,
+                effective_to: replacement.effective_from,
+                submitted_by: previous.submitted_by,
+                submitted_at: previous.submitted_at,
+                supersedes: null,
+                origin: remainder,
+                carried_from: previous,
+                status: active,
+                recorded_at: replacement.recorded_at,
+                approved_by: replacement.approved_by
+            )
+        if replacement.effective_to != null
+            and (previous.effective_to = null or replacement.effective_to < previous.effective_to):
+            InputVersion.created(
+                series: previous.series,
+                content_hash: previous.content_hash,
+                effective_from: replacement.effective_to,
+                effective_to: previous.effective_to,
+                submitted_by: previous.submitted_by,
+                submitted_at: previous.submitted_at,
+                supersedes: null,
+                origin: remainder,
+                carried_from: previous,
+                status: active,
+                recorded_at: replacement.recorded_at,
+                approved_by: replacement.approved_by
+            )
+}
+
+-- Life-cycle event (D-023): a new fact replaces the target from
+-- effective_from to the end of the target's range, possibly back-dated (an
+-- exercise notified late). The part before effective_from stays authoritative
+-- as a remainder. One right suffices; an authoritative feed's service
+-- identity may hold it. Not a correction: no second person.
+rule RecordSuccession {
+    when: SuccessionRecorded(submitter, target, content_hash, effective_from)
+    requires: target.status = active
+    requires: permitted(submitter, "input.succession", target.series)
+    requires: effective_from > target.effective_from
+    requires: target.effective_to = null or effective_from < target.effective_to
+    ensures:
+        let successor = InputVersion.created(
+            series: target.series,
+            content_hash: content_hash,
+            effective_from: effective_from,
+            effective_to: target.effective_to,
+            submitted_by: submitter,
+            submitted_at: now,
+            supersedes: target,
+            origin: succession,
+            carried_from: null,
+            status: active,
+            recorded_at: now,
+            approved_by: null
+        )
+        VersionReplaced(replacement: successor, previous: target)
+}
+
+-- A fix made in an approved system of record (amended or cancelled
+-- booking, republished rate) arrives already approved by that system's own
+-- controls (D-042): recorded at once, with reconciliation (16) as Veridian's
+-- check. Only the source's adapter identity holds this right; corrections
+-- made inside Veridian still need a second person (ProposeCorrection).
+rule RecordSourceCorrection {
+    when: SourceCorrectionRecorded(submitter, target, content_hash, effective_from, effective_to?)
+    requires: target.status = active
+    requires: permitted(submitter, "input.source_correction", target.series)
+    requires: effective_from >= target.effective_from
+    requires: target.effective_to = null
+        or (effective_to != null and effective_to <= target.effective_to)
+    ensures:
+        let fixed = InputVersion.created(
+            series: target.series,
+            content_hash: content_hash,
+            effective_from: effective_from,
+            effective_to: effective_to,
+            submitted_by: submitter,
+            submitted_at: now,
+            supersedes: target,
+            origin: correction,
+            carried_from: null,
+            status: active,
+            recorded_at: now,
+            approved_by: null
+        )
+        VersionReplaced(replacement: fixed, previous: target)
+}
+
+-- Generic change signal (D-024): consumers (batch schedules, standing views)
+-- subscribe by series, never by meaning, keeping the platform agnostic.
+rule AnnounceInputChange {
+    when: version: InputVersion.status becomes active
+    ensures: InputChanged(series: version.series, version: version)
+}
+
+rule RejectCorrection {
+    when: CorrectionRejected(reviewer, correction, reason)
+    requires: correction.status = proposed
+    requires: reviewer != correction.submitted_by
+    requires: permitted(reviewer, "input.approve_correction", correction.series)
+    requires: freshly_authenticated(reviewer)
+    ensures:
+        correction.status = rejected
+        correction.rejected_by = reviewer
+        correction.rejection_reason = reason
+}
+
+-- A correction waiting for approval whose target has since been superseded
+-- (by another correction, a succession or a source correction) can never be
+-- approved. It is closed at once with the reason and its author is told, who
+-- proposes again against the current version if the fix is still needed; it
+-- is never re-targeted, so an approver only ever approves what they saw
+-- (D-051).
+rule FindStaleCorrections {
+    when: VersionReplaced(replacement, previous)
+    ensures:
+        for c in pending_corrections_of(previous):
+            StaleCorrectionFound(correction: c)
+}
+
+rule RejectStaleCorrection {
+    when: StaleCorrectionFound(correction)
+    requires: correction.status = proposed
+    ensures:
+        correction.status = rejected
+        correction.rejection_reason = "target superseded while the correction was pending"
+        StaleCorrectionRejected(correction: correction, author: correction.submitted_by)
+}
+
+-- Batches (D-051). Members were proposed one by one, each against its own
+-- target; the batch is one review and one approval action, and every member
+-- is approved or rejected through the ordinary rules, so lineage is per
+-- version.
+rule ProposeCorrectionBatch {
+    when: CorrectionBatchProposed(submitter, corrections)
+    requires: corrections.count >= 2
+    requires: corrections.all(c => c.status = proposed and c.submitted_by = submitter)
+    ensures: CorrectionBatch.created(
+        submitted_by: submitter,
+        submitted_at: now,
+        corrections: corrections,
+        status: awaiting_review
+    )
+}
+
+rule ApproveCorrectionBatch {
+    when: CorrectionBatchApproved(approver, batch)
+    requires: batch.status = awaiting_review
+    requires: approver != batch.submitted_by
+    requires: batch.corrections.all(c => c.status = proposed
+        and c.supersedes.status = active
+        and permitted(approver, "input.approve_correction", c.series))
+    requires: freshly_authenticated(approver)
+    ensures:
+        batch.status = approved
+        batch.approved_by = approver
+        for c in batch.corrections:
+            CorrectionApproved(approver: approver, correction: c)
+}
+
+rule RejectCorrectionBatch {
+    when: CorrectionBatchRejected(reviewer, batch, reason)
+    requires: batch.status = awaiting_review
+    requires: reviewer != batch.submitted_by
+    requires: batch.corrections.all(c => permitted(reviewer, "input.approve_correction", c.series))
+    requires: freshly_authenticated(reviewer)
+    ensures:
+        batch.status = declined
+        batch.rejection_reason = reason
+        for c in batch.corrections:
+            CorrectionRejected(reviewer: reviewer, correction: c, reason: reason)
+}
+
+-- A batch is all or nothing: when one member goes stale the rest of the batch
+-- is closed with it, and the author proposes again.
+rule RejectBatchOfStaleMember {
+    when: StaleCorrectionRejected(correction, author)
+    let batch = batch_containing(correction)
+    requires: batch != null
+    requires: batch.status = awaiting_review
+    ensures:
+        batch.status = declined
+        batch.rejection_reason = "a member correction became stale"
+        for c in batch.corrections:
+            CorrectionDroppedWithBatch(correction: c)
+}
+
+rule DropBatchMember {
+    when: CorrectionDroppedWithBatch(correction)
+    requires: correction.status = proposed
+    ensures:
+        correction.status = rejected
+        correction.rejection_reason = "its batch was rejected"
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At any knowledge time, one series has at most one authoritative statement
+-- for any effective instant.
+invariant NoOverlappingActiveVersions {
+    for a in InputVersions:
+        for b in InputVersions:
+            a != b and a.series = b.series
+                and a.status = active and b.status = active
+                implies
+                    (a.effective_to != null and a.effective_to <= b.effective_from)
+                    or (b.effective_to != null and b.effective_to <= a.effective_from)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor DataSteward {
+    identified_by: User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- Who may do what is decided by permitted(...) in each rule; the surface
+-- lists the operations and what a steward sees.
+surface InputDataManagement {
+    facing steward: DataSteward
+    context series: InputSeries
+
+    exposes:
+        series.key
+        series.schema_ref
+        series.data_class
+        for v in series.active_versions:
+            v.content_hash
+            v.effective_from
+            v.effective_to
+            v.is_correction
+
+    provides:
+        InputSeriesRegistered(steward, key, schema_ref, data_class)
+        InputVersionSubmitted(steward, series, content_hash, effective_from, effective_to?, lineage_ref?)
+        CorrectionProposed(steward, target, content_hash, effective_from, effective_to?)
+        CorrectionApproved(steward, correction)
+        CorrectionRejected(steward, correction, reason)
+        CorrectionBatchProposed(steward, corrections)
+        CorrectionBatchApproved(steward, batch) when batch.status = awaiting_review
+        CorrectionBatchRejected(steward, batch, reason) when batch.status = awaiting_review
+        SuccessionRecorded(steward, target, content_hash, effective_from)
+        SourceCorrectionRecorded(steward, target, content_hash, effective_from, effective_to?)
+
+    contracts:
+        demands InputRetention
+
+    @guarantee EveryOperationAttributed
+        -- Every operation carries the identified steward; anonymous calls
+        -- are impossible and refusals are audited (03-identity-access).
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Point-in-time resolution, used by every calculation request:
+--   resolve_version(series, as_of, known_at) returns the version v with
+--   v.effective_from <= as_of < v.effective_to (or open-ended),
+--   v.recorded_at <= known_at, and not superseded at known_at
+--   (v.superseded_at absent or > known_at). Black box; pure.
+-- permitted(user, action, target): black box, see 03-identity-access.allium.
+-- pending_corrections_of(version): corrections in status proposed whose
+--   target is that version. batch_containing(correction): the batch the
+--   correction belongs to, or null.
+-- StaleCorrectionRejected notifies the correction's author (console, 12).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved: partial corrections split the target (D-006); golden data is
+-- bitemporal and corrected like production (D-007).
+-- Resolved (D-026, D-042): service identities are distinct from people
+-- (04); a system user never approves a correction, but an approved system
+-- of record's adapter records fixes made under that system's own controls
+-- (RecordSourceCorrection), checked by reconciliation (16).
+-- Resolved (D-051): a stale pending correction is rejected automatically and
+-- never re-targeted; one target per correction, with a batch for many
+-- (approved or rejected as a whole); input versions are never purged while a
+-- retained result or reported figure depends on them.

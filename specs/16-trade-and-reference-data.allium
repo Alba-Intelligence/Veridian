@@ -1,0 +1,375 @@
+-- allium: 3
+-- 16-trade-and-reference-data.allium
+
+-- Scope: How trades, positions and reference data enter Veridian from the
+--   bank's systems of record, and how completeness is proven (D-042,
+--   accepted).
+-- Includes: feed deliveries (end-of-day snapshots and intraday events),
+--   control totals, reconciliation against the source, breaks with owners,
+--   ageing and escalation, unresolved references, intra-group mirror trades,
+--   the book and legal entity hierarchy, counterparties, issuers, securities
+--   and ratings.
+-- Excludes:
+--   - Versioning (01), source approval and adapters (10): reused as is.
+--   - Payload content and validation (instrument schemas): Julia (D-018).
+--   - General-ledger reconciliation: later; v1 reconciles with the source
+--     systems and the front-office valuations.
+-- Dependencies: 01, 02, 06, 10, 13.
+--
+-- Principles (D-042):
+--   - Veridian is never the system of record for trades or reference data;
+--     it holds bitemporal copies, each version carrying its lineage (D-035).
+--   - Each source is a DataSource (10) with a feed kind and a business data
+--     owner. Trades are one series per source trade id; life-cycle events
+--     are successions (D-023); bookings fixed in the source (amendments,
+--     cancellations, republished rates) are corrections approved by the
+--     source system's own controls, with reconciliation as Veridian's check;
+--     corrections made inside Veridian keep four-eyes (D-007).
+--   - End-of-day snapshots prove completeness; intraday events keep desk
+--     views current (14). A snapshot item whose content hash is unchanged
+--     records no new version.
+--   - Free reference data where terms allow (docs/design/data-sources.md):
+--     GLEIF legal entity identifiers for counterparties, issuers and group
+--     structure (CC0, wording to confirm); ESMA FIRDS for bond static data
+--     once bulk access and fields are confirmed (reproduction allowed with
+--     acknowledgement). Ratings are synthetic in v1 (agency ratings are paid, D-034); a
+--     bank plugs in its agency or internal ratings.
+--   - A trade whose references (book, counterparty, issuer, security) do not
+--     resolve is recorded, then excluded from calculations by the planner and
+--     listed as a material break on every run that would have used it; it is
+--     never silently dropped and never fails the whole run.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./10-data-ingestion-and-synthetic.allium" as ingest
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract ReferenceHierarchy {
+    resolve_hierarchy: (as_of: Timestamp, known_at: Timestamp) -> String
+
+    @invariant OneEntityPerBook
+        -- Every book belongs to exactly one desk and one legal entity at any
+        -- as_of (D-039); a move between desks or entities is a succession
+        -- effective from a date, so results follow the hierarchy as of as_of.
+
+    @invariant Acyclic
+        -- The hierarchy (legal entity, desk, book) has no cycles; a version
+        -- that would create one is rejected at validation.
+
+    @invariant ParentGrantsCoverChildren
+        -- A role grant on a legal entity or desk covers its books as of the
+        -- moment of the access check (04, permitted).
+
+    @invariant IntraGroupFlagged
+        -- A trade whose counterparty is a group legal entity is intra-group.
+        -- Matched mirror pairs are eliminated in the consolidated perimeter
+        -- (D-039); an intra-group trade without a matching mirror is a break
+        -- and is not eliminated.
+}
+
+contract ExplicitExclusions {
+    plan_positions: (subjects: Set<data/InputSeries>, as_of: Timestamp, known_at: Timestamp) -> String
+
+    @invariant ExcludedPositionsListed
+        -- The planner returns, with every plan, the positions it excluded
+        -- and why (unresolved book, counterparty, issuer or security). The
+        -- list is part of the plan's result, so it is hashed, kept and shown
+        -- on the run, its sign-off and its exports.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- One delivery from a system of record for a business date.
+entity FeedDelivery {
+    source: ingest/DataSource
+    business_date: Timestamp
+    delivery_kind: snapshot | events
+    ingestion: ingest/IngestionRun
+    received_at: Timestamp
+}
+
+-- A figure the source asserts about its own delivery (e.g. trade count and
+-- notional per book and currency), to be matched by Veridian.
+entity ControlTotal {
+    delivery: FeedDelivery
+    scope_ref: String
+    measure: String
+    expected: Decimal
+}
+
+-- Comparison of one snapshot (and its control totals and front-office
+-- valuations, if supplied) with what Veridian resolves at the same as_of and
+-- cut-off. Computed through the graph, so it is memoized and traceable.
+entity Reconciliation {
+    delivery: FeedDelivery
+    recon_ref: String
+    as_of: Timestamp
+    cutoff: Timestamp
+    started_at: Timestamp
+    recon_state: reconciling | matched | breaks_found | recon_failed
+    finished_at: Timestamp?
+
+    transitions recon_state {
+        reconciling -> matched
+        reconciling -> breaks_found
+        reconciling -> recon_failed
+        terminal: matched, breaks_found, recon_failed
+    }
+}
+
+entity ReconciliationBreak {
+    reconciliation: Reconciliation
+    scope_ref: String
+    kind: missing_in_veridian | missing_in_source | value_mismatch | unresolved_reference | intragroup_unmatched
+    detail: String
+    material: Boolean
+    owner: data/User
+    opened_at: Timestamp
+    -- Two business days of the source's calendar after opening (D-042).
+    escalate_at: Timestamp
+    escalated: Boolean
+    explanation: String?
+    explained_by: data/User?
+    cleared_at: Timestamp?
+    break_state: unexplained | explained | cleared
+
+    transitions break_state {
+        unexplained -> explained
+        unexplained -> cleared
+        explained -> cleared
+        terminal: cleared
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    break_escalation_business_days: Integer = 2
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RecordDelivery {
+    when: DeliveryReceived(adapter, source, business_date, delivery_kind, run)
+    requires: adapter = source.adapter_identity
+    requires: source.feed in {trades, positions, hierarchy, parties, securities, ratings}
+    requires: run.source = source
+    requires: not exists FeedDelivery{source: source, business_date: business_date, delivery_kind: snapshot, ingestion: run}
+    ensures:
+        FeedDelivery.created(
+            source: source,
+            business_date: business_date,
+            delivery_kind: delivery_kind,
+            ingestion: run,
+            received_at: now
+        )
+        for c in delivered_control_totals(run):
+            ControlTotalDelivered(source: source, business_date: business_date, run: run, control: c)
+}
+
+rule RecordControlTotal {
+    when: ControlTotalDelivered(source, business_date, run, control)
+    let delivery = FeedDelivery{source: source, business_date: business_date, ingestion: run}
+    requires: exists delivery
+    ensures: ControlTotal.created(
+        delivery: delivery,
+        scope_ref: control_scope(control),
+        measure: control_measure(control),
+        expected: control_value(control)
+    )
+}
+
+-- A loaded snapshot is reconciled at its business date's end of day, as
+-- known at the moment the snapshot was recorded.
+rule StartReconciliation {
+    when: delivery: FeedDelivery.created
+    requires: delivery.delivery_kind = snapshot
+    requires: delivery.ingestion.outcome = recorded
+    let ref = recon_ref_of(delivery)
+    ensures:
+        Reconciliation.created(
+            delivery: delivery,
+            recon_ref: ref,
+            as_of: end_of_business_date(delivery),
+            cutoff: now,
+            started_at: now,
+            recon_state: reconciling
+        )
+        graph/CalculationRequested(
+            requester: delivery.source.adapter_identity,
+            model: reconciliation_model(delivery.source),
+            subjects: reconciliation_subjects(delivery),
+            data_class: production,
+            as_of: end_of_business_date(delivery),
+            known_at: now,
+            origin_ref: ref
+        )
+}
+
+rule ReconciliationCompletes {
+    when: request: graph/CalculationRequest.status transitions_to fulfilled
+    let recon = Reconciliation{recon_ref: request.origin_ref}
+    requires: exists recon
+    requires: recon.recon_state = reconciling
+    let found = breaks_in(request)
+    ensures:
+        recon.finished_at = now
+        if found.count = 0:
+            recon.recon_state = matched
+        else:
+            recon.recon_state = breaks_found
+            for b in found:
+                BreakFound(reconciliation: recon, finding: b)
+}
+
+rule ReconciliationFails {
+    when: request: graph/CalculationRequest.status transitions_to unfulfilled
+    let recon = Reconciliation{recon_ref: request.origin_ref}
+    requires: exists recon
+    requires: recon.recon_state = reconciling
+    ensures:
+        recon.recon_state = recon_failed
+        recon.finished_at = now
+        ingest/DataQualityAlert(source: recon.delivery.source, problem: "reconciliation failed")
+}
+
+-- A break already open for the same scope and kind is not duplicated: it
+-- stays one break until cleared.
+rule RecordBreak {
+    when: BreakFound(reconciliation, finding)
+    let scope = finding_scope(finding)
+    let kind = finding_kind(finding)
+    requires: not exists ReconciliationBreak{scope_ref: scope, kind: kind, break_state: unexplained}
+    requires: not exists ReconciliationBreak{scope_ref: scope, kind: kind, break_state: explained}
+    ensures:
+        ReconciliationBreak.created(
+            reconciliation: reconciliation,
+            scope_ref: scope,
+            kind: kind,
+            detail: finding_detail(finding),
+            material: is_material(finding, reconciliation.delivery.source),
+            owner: reconciliation.delivery.source.data_owner,
+            opened_at: now,
+            escalate_at: business_days_after(reconciliation.delivery.source, now, config.break_escalation_business_days),
+            escalated: false,
+            break_state: unexplained
+        )
+        ingest/DataQualityAlert(source: reconciliation.delivery.source, problem: "reconciliation break")
+}
+
+rule ExplainBreak {
+    when: BreakExplained(user, brk, explanation)
+    requires: brk.break_state = unexplained
+    requires: data/permitted(user, "break.explain", brk.scope_ref)
+    ensures:
+        brk.break_state = explained
+        brk.explanation = explanation
+        brk.explained_by = user
+}
+
+-- A break clears when a later reconciliation of the same source no longer
+-- finds it.
+rule ClearResolvedBreaks {
+    when: recon: Reconciliation.recon_state transitions_to matched
+    ensures:
+        for b in ReconciliationBreaks where break_state != cleared:
+            if b.reconciliation.delivery.source = recon.delivery.source:
+                b.break_state = cleared
+                b.cleared_at = now
+}
+
+rule ClearBreaksNotFoundAgain {
+    when: recon: Reconciliation.recon_state transitions_to breaks_found
+    ensures:
+        for b in ReconciliationBreaks where break_state != cleared:
+            if b.reconciliation.delivery.source = recon.delivery.source
+                and b.reconciliation != recon
+                and not still_found(recon, b.scope_ref, b.kind):
+                b.break_state = cleared
+                b.cleared_at = now
+}
+
+rule EscalateAgedBreak {
+    when: brk: ReconciliationBreak.escalate_at <= now
+    requires: brk.break_state = unexplained
+    requires: not brk.escalated
+    ensures:
+        brk.escalated = true
+        BreakEscalated(brk: brk, owner: brk.owner)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor DataOwner {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface FeedIntake {
+    facing adapter: ingest/SourceAdapter
+
+    provides:
+        DeliveryReceived(adapter, source, business_date, delivery_kind, run)
+}
+
+surface BreakManagement {
+    facing owner: DataOwner
+    context brk: ReconciliationBreak
+
+    exposes:
+        brk.scope_ref
+        brk.kind
+        brk.detail
+        brk.material
+        brk.opened_at
+        brk.break_state
+        brk.explanation
+        brk.reconciliation.delivery.business_date
+        brk.reconciliation.delivery.source.name
+
+    provides:
+        BreakExplained(owner, brk, explanation) when brk.break_state = unexplained
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- delivered_control_totals, control_scope, control_measure, control_value:
+--   read from the delivery (adapter output).
+-- recon_ref_of, end_of_business_date, reconciliation_model,
+--   reconciliation_subjects: the reconciliation calculation (Julia) compares
+--   the snapshot, control totals and any front-office valuations with
+--   Veridian's resolved positions; breaks_in(request) reads its findings.
+-- finding_scope, finding_kind, finding_detail, still_found: fields of
+--   findings. is_material(finding, source): thresholds per source and book
+--   from configuration.
+-- business_days_after(source, from, n): the instant n business days later in
+--   the source's calendar (03), with a per-source override in configuration.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-042): snapshots plus intraday events; source-system fixes
+-- approved by the source's controls with reconciliation as the check;
+-- unresolved references recorded, excluded and listed; control totals plus
+-- front-office valuations, general ledger later; material breaks explained
+-- before sign-off; the bank's entity master is authoritative and parent
+-- grants cover children; GLEIF and (once confirmed) ESMA FIRDS, synthetic
+-- ratings in v1; escalation after 2 business days of the source's calendar.
+open question "ESMA FIRDS: confirm automated bulk download is permitted and that bond maturity, coupon, currency and issuer LEI are published, before building its adapter."

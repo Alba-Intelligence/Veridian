@@ -1,0 +1,744 @@
+-- allium: 3
+-- 02-calculation-graph.allium
+
+-- Scope: The content-addressed calculation graph: Veridian's memoization
+--   system of record (extreme reuse of results).
+-- Includes: model versions and their promotion, calculation requests pinned
+--   to a knowledge time, planned steps, immutable calculation nodes keyed by
+--   calc_id, memo hits, stampede control, early cutoff, retries, timeouts and
+--   ringfenced failure.
+-- Excludes:
+--   - Bitemporal input versions (01-bitemporal-data.allium).
+--   - Identity, rights, audit (03-identity-access.allium).
+--   - Worker process supervision and wire protocol (04-julia-worker.allium);
+--     here a worker is the external party that fulfils DeterministicComputation.
+--   - Instrument maths (05-irs-pricing.allium) and FRTB (06-frtb-girr.allium).
+--   - Standing views that re-evaluate when new data arrives (later spec).
+-- Dependencies: 01-bitemporal-data.allium.
+--
+-- Identity rule (the heart of memoization):
+--   calc_id = hash(model version identity, as_of, content hashes of the
+--                  resolved input versions, result_hash of each prerequisite
+--                  node, calculation context)
+--   The request's known_at chooses which versions are resolved but is NOT
+--   hashed, so identical data reached at different times reuses results.
+--   Hashing prerequisite result_hash (not prerequisite calc_id) gives early
+--   cutoff: an upstream change that leaves a result byte-identical leaves
+--   every downstream calc_id unchanged.
+-- Complete nodes are never invalidated: a node is valid forever for exactly
+-- its inputs. "Invalidation" is a new request resolving to new calc_ids.
+
+use "./01-bitemporal-data.allium" as data
+use "./05-configuration-release.allium" as cfg
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract DeterministicComputation {
+    compute: (calc_id: String, model: ModelVersion, as_of: Timestamp, inputs: Set<data/InputVersion>, prerequisite_results: Set<String>) -> String
+
+    @invariant Purity
+        -- The result depends only on the arguments: no clock, no environment
+        -- variables, no direct database or network reads, no global state.
+
+    @invariant Determinism
+        -- Identical arguments produce a byte-identical result and therefore
+        -- the same result_hash, on any worker, after any restart.
+
+    @invariant CanonicalInputOrdering
+        -- Inputs and prerequisite results are consumed in a canonical order
+        -- (sorted by content hash); set iteration order never affects output.
+
+    @invariant CanonicalRounding
+        -- result_hash is computed over the canonical form of the result
+        -- (D-004, D-015): rounding half-even; monetary amounts to 4 decimal
+        -- places of the currency unit; rates and percentages to one hundredth
+        -- of a basis point (0.000001 as a decimal rate); discount factors to
+        -- 7 significant digits. Year fractions are exact rationals defined by their
+        -- day-count convention (ISDA 2006 s4.16) and are never rounded.
+        -- Timestamps are UTC with microsecond precision. Two results equal
+        -- after canonical rounding have the same result_hash, which drives
+        -- early cutoff.
+
+    @invariant VersionedHashScheme
+        -- Every calc_id, content_hash and result_hash names the hashing
+        -- scheme that produced it (algorithm and canonical encoding version,
+        -- D-041). A new scheme arrives only in a reviewed release; existing
+        -- identifiers stay valid under their own scheme and are never
+        -- rewritten. A node is carried into a new scheme only by recomputing
+        -- it and checking that the result is equal after canonical rounding;
+        -- the link between the old and new identifiers is recorded.
+
+    @guidance
+        -- Random seeds, where needed, are derived from calc_id.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A versioned calculation function (e.g. "irs_pv" 1.2.0) bound to exact code.
+-- It arrives only inside a configuration release (05, D-016): four-eyes is
+-- the release's code review. Identity is the code, not the release, so a model
+-- carried unchanged into the next release keeps its calc_ids.
+entity ModelVersion {
+    function_name: String
+    version: String
+    code_hash: String
+    first_release: cfg/ConfigurationRelease
+    registered_at: Timestamp
+}
+
+-- What a user asked for, pinned to the moment it was asked.
+entity CalculationRequest {
+    requested_by: data/User
+    model: ModelVersion
+    subjects: Set<data/InputSeries>
+    data_class: data/DataClass
+    as_of: Timestamp
+    known_at: Timestamp
+    -- Who or what asked: a screen, an API client, a batch run (06). Free text
+    -- reference used for traceability and for batch runs to find their request.
+    origin_ref: String?
+    requested_at: Timestamp
+    status: open | fulfilled | unfulfilled
+    completed_at: Timestamp when status = fulfilled | unfulfilled
+    failure_reason: String when status = unfulfilled
+
+    transitions status {
+        open -> fulfilled
+        open -> unfulfilled
+        terminal: fulfilled, unfulfilled
+    }
+
+    -- True once the planning step's DAG has been turned into evaluation steps.
+    plan_expanded: Boolean
+
+    steps: PlannedStep with request = this
+    all_done: plan_expanded and steps.all(s => s.status = done)
+    any_abandoned: steps.any(s => s.status = abandoned)
+}
+
+-- One node of the request's plan. It can only be identified (given a calc_id)
+-- once all prerequisites are done, because calc_id includes their result hashes.
+entity PlannedStep {
+    request: CalculationRequest
+    model: ModelVersion
+    inputs: Set<data/InputVersion>
+    prerequisites: Set<PlannedStep>
+    -- planning: the Julia planner computing the DAG (D-020);
+    -- evaluation: any node of that DAG (pricing, shocks, sensitivities, ...).
+    purpose: planning | evaluation
+    status: waiting | running | done | abandoned | cancelled
+
+    calc_id: String when status = running | done | abandoned
+    node: CalculationNode when status = running | done | abandoned
+    memo_hit: Boolean when status = running | done | abandoned
+
+    transitions status {
+        waiting -> running
+        waiting -> done
+        waiting -> cancelled
+        waiting -> abandoned
+        running -> done
+        running -> abandoned
+        terminal: done, abandoned, cancelled
+    }
+
+    is_ready: prerequisites.all(p => p.status = done)
+    node_available: node.status = complete and node.reproducible and node.payload?.tier in {hot, cold}
+    node_failed: node.status = failed or not node.reproducible
+    request_failed: request.status = unfulfilled
+}
+
+-- The memoized calculation itself. Immutable once complete; shared by every
+-- step, in any request, that resolves to the same calc_id.
+entity CalculationNode {
+    calc_id: String
+    model: ModelVersion
+    as_of: Timestamp
+    inputs: Set<data/InputVersion>
+    prerequisite_nodes: Set<CalculationNode>
+    data_class: data/DataClass
+    created_at: Timestamp
+    attempts: Integer
+    dispatched_at: Timestamp?
+    status: pending | computing | complete | failed
+
+    result_hash: String when status = complete
+    completed_at: Timestamp when status = complete
+    failure_reason: String when status = failed
+    failed_at: Timestamp when status = failed
+
+    transitions status {
+        pending -> computing
+        computing -> complete
+        computing -> pending
+        computing -> failed
+        terminal: complete, failed
+    }
+
+    -- False once a recomputation failed to reproduce result_hash.
+    reproducible: Boolean
+
+    payload: ResultPayload with node = this
+    steps: PlannedStep with node = this
+}
+
+-- Result payload storage (D-005). The node (provenance and result_hash) is
+-- kept; only the payload ages out. A purged payload is recomputed on demand
+-- and must reproduce the node's result_hash.
+entity ResultPayload {
+    node: CalculationNode
+    tier: hot | cold | purged
+    tier_since: Timestamp
+    result_ref: String when tier = hot | cold
+    -- True while a recomputation of this purged payload is dispatched and not
+    -- yet answered (D-062): later steps attach to it, no second one is sent.
+    recomputing: Boolean
+
+    transitions tier {
+        hot -> cold
+        cold -> purged
+        purged -> hot
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    max_attempts: Integer = 3
+    compute_timeout: Duration = 10.minutes
+    -- Development values (D-005); production values configured later.
+    hot_retention: Duration = 7.days
+    cold_retention: Duration = 30.days
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Model governance (D-016): models are registered when a release activates;
+-- there is no runtime submission or approval. Independent validation of each
+-- model version, and the gate it puts on production releases, are spec 21
+-- (D-050).
+rule RegisterReleaseModels {
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for m in release_models(release):
+            if not exists ModelVersion{code_hash: model_code_hash(m)}:
+                ModelVersion.created(
+                    function_name: model_function_name(m),
+                    version: model_version_label(m),
+                    code_hash: model_code_hash(m),
+                    first_release: release,
+                    registered_at: now
+                )
+}
+
+-- A request is pinned to a knowledge time: now by default, or an earlier
+-- instant (batch cut-off D-016, or reproducing what was known in the past).
+-- Its subjects must resolve at (as_of, known_at), otherwise it is refused up
+-- front (D-008). Production data needs a model in the active production
+-- release; golden, synthetic and test may also use the active development
+-- release. A whatif request (D-038) uses production models and may name
+-- production subjects alongside its author's whatif series.
+rule AcceptCalculationRequest {
+    -- model: calc_graph.submit
+    when: CalculationRequested(requester, model, subjects, data_class, as_of, known_at?, origin_ref?)
+    let pinned = known_at ?? now
+    requires: pinned <= now
+    requires: data/permitted(requester, "calc.request", model)
+    requires: subjects.all(s => s.data_class = data_class
+        or (data_class = whatif and s.data_class = production))
+    requires: subjects.all(s => s.data_class != whatif or s.created_by = requester)
+    requires: subjects.all(s => resolvable(s, as_of, pinned))
+    requires: model_in_release(model, cfg/active_release(production))
+        or (data_class in {golden, synthetic, test} and model_in_release(model, cfg/active_release(development)))
+    ensures: CalculationRequest.created(
+        requested_by: requester,
+        model: model,
+        subjects: subjects,
+        data_class: data_class,
+        as_of: as_of,
+        known_at: pinned,
+        origin_ref: origin_ref,
+        requested_at: now,
+        status: open,
+        plan_expanded: false
+    )
+}
+
+-- Planning is itself a memoized Julia calculation (D-018, D-020): its calc_id
+-- covers the planner version, the subjects' content and the configuration
+-- release, so re-requesting the same thing reuses the plan.
+rule StartPlanning {
+    when: request: CalculationRequest.created
+    ensures: PlannedStep.created(
+        request: request,
+        model: planner_for(request.model),
+        inputs: resolve_all(request.subjects, request.as_of, request.known_at),
+        prerequisites: {},
+        purpose: planning,
+        status: waiting
+    )
+}
+
+-- One pass (D-020): the plan names every evaluation node with the series it
+-- needs and its prerequisites. Elixir resolves the series bitemporally; it
+-- never interprets instrument content. Any unresolvable series fails the
+-- request before evaluation starts (D-008).
+rule ExpandPlan {
+    when: step: PlannedStep.status transitions_to done
+    requires: step.status = done
+    requires: step.purpose = planning
+    requires: step.request.status = open
+    requires: not step.request.plan_expanded
+    let request = step.request
+    let entries = plan_entries(step.node)
+    ensures:
+        if unresolved_series(entries, request.as_of, request.known_at).count > 0:
+            PlanningFailed(request: request, reason: "unresolvable input series")
+        else:
+            request.plan_expanded = true
+            for e in entries:
+                StepPlanned(
+                    request: request,
+                    model: entry_model(e),
+                    inputs: resolve_all(entry_series(e), request.as_of, request.known_at),
+                    prerequisites: entry_prerequisites(e, request)
+                )
+}
+
+rule AddPlannedStep {
+    when: StepPlanned(request, model, inputs, prerequisites)
+    requires: request.status = open
+    requires: prerequisites.all(p => p.request = request)
+    requires: inputs.all(v => v.series.data_class = request.data_class
+        or (request.data_class = whatif and v.series.data_class = production))
+    ensures: PlannedStep.created(
+        request: request,
+        model: model,
+        inputs: inputs,
+        prerequisites: prerequisites,
+        purpose: evaluation,
+        status: waiting
+    )
+}
+
+-- Binding a ready step to its node. Exactly one branch applies:
+--   complete node  -> memo hit, no computation
+--   irreproducible node -> the step is abandoned at once (D-062): the node can
+--                          no longer serve results, a recomputation cannot help
+--   purged payload -> recomputed once (D-062): the first step starts it and
+--                     marks the payload; later steps attach to it
+--   in-flight node -> stampede control: attach, no second computation
+--   failed node    -> failure is terminal for that calc_id
+--   no node        -> miss: exactly one new node is created
+-- Steps of a request that has already failed are not bound (they are cancelled).
+rule StepBindsToNode {
+    -- model: calc_graph.bindNew calc_graph.bindExisting
+    when: step: PlannedStep.is_ready
+    requires: step.status = waiting
+    requires: step.request.status = open
+    let id = calc_id_of(step.model, step.request.as_of, step.inputs, prerequisite_result_hashes(step.prerequisites))
+    let existing = CalculationNode{calc_id: id}
+    ensures:
+        if exists existing:
+            step.calc_id = id
+            step.node = existing
+            step.memo_hit = true
+            if existing.status = complete and not existing.reproducible:
+                step.status = abandoned
+            else if existing.status = complete and existing.payload?.tier = purged:
+                step.status = running
+                if not existing.payload.recomputing:
+                    existing.payload.recomputing = true
+                    RematerialisationRequested(payload: existing.payload)
+            else if existing.status = complete:
+                step.status = done
+            else if existing.status = failed:
+                step.status = abandoned
+            else:
+                step.status = running
+        else:
+            let node = CalculationNode.created(
+                calc_id: id,
+                model: step.model,
+                as_of: step.request.as_of,
+                inputs: step.inputs,
+                prerequisite_nodes: prerequisite_nodes(step.prerequisites),
+                -- In a whatif request, a step that touches no whatif input
+                -- (directly or through prerequisites) is a production node:
+                -- calc_id ignores the class, so it is shared with production.
+                data_class: node_class_of(step),
+                created_at: now,
+                attempts: 0,
+                dispatched_at: null,
+                status: pending,
+                reproducible: true
+            )
+            step.status = running
+            step.calc_id = id
+            step.node = node
+            step.memo_hit = false
+}
+
+-- Dispatch to a worker (on creation and on each retry).
+rule DispatchNode {
+    -- model: calc_graph.dispatch
+    when: node: CalculationNode.status becomes pending
+    requires: node.attempts < config.max_attempts
+    ensures:
+        node.status = computing
+        node.attempts = node.attempts + 1
+        ComputationDispatched(node: node)
+}
+
+-- The compute timeout runs from the moment a worker takes the job, not from
+-- dispatch: time spent in the bounded queue (07) never counts against it.
+rule ComputationStartsOnWorker {
+    when: ComputationAssigned(node)
+    requires: node.status = computing
+    ensures: node.dispatched_at = now
+}
+
+rule ComputationSucceeds {
+    -- model: calc_graph.succeed
+    when: ComputationSucceeded(worker, node, result_ref, result_hash)
+    requires: node.status = computing
+    ensures:
+        node.status = complete
+        node.result_hash = result_hash
+        node.completed_at = now
+        node.dispatched_at = null
+        ResultPayload.created(node: node, tier: hot, tier_since: now, result_ref: result_ref, recomputing: false)
+}
+
+rule PayloadMovesToColdStorage {
+    -- model: calc_graph.cool
+    when: payload: ResultPayload.tier_since + config.hot_retention <= now
+    requires: payload.tier = hot
+    ensures:
+        payload.tier = cold
+        payload.tier_since = now
+}
+
+rule PayloadPurged {
+    -- model: calc_graph.purge
+    when: payload: ResultPayload.tier_since + config.cold_retention <= now
+    requires: payload.tier = cold
+    ensures:
+        payload.tier = purged
+        payload.tier_since = now
+        payload.result_ref = null
+}
+
+-- A purged result is needed again: recompute it and prove determinism by
+-- matching the recorded result_hash. Stampede control applies: concurrent
+-- requests for the same purged payload trigger one recomputation: the first
+-- step binding to the payload sets `recomputing` (StepBindsToNode), so this
+-- rule fires once per recomputation (D-062).
+rule RematerialisationDispatched {
+    -- model: calc_graph.bindExisting calc_graph.oneRematInFlight
+    when: RematerialisationRequested(payload)
+    requires: payload.tier = purged
+    ensures: RecomputationDispatched(payload: payload)
+}
+
+rule RematerialisationSucceeds {
+    -- model: calc_graph.rematAnswer
+    when: RematerialisationCompleted(worker, payload, result_ref, result_hash)
+    requires: payload.tier = purged
+    requires: payload.node.status = complete
+    ensures:
+        payload.recomputing = false
+        if result_hash = payload.node.result_hash:
+            payload.tier = hot
+            payload.tier_since = now
+            payload.result_ref = result_ref
+        else:
+            ReproducibilityBreachDetected(node: payload.node, observed_hash: result_hash)
+}
+
+-- A breach is a model-risk incident: the node can no longer serve results.
+rule MarkNodeIrreproducible {
+    -- model: calc_graph.rematAnswer
+    when: ReproducibilityBreachDetected(node, observed_hash)
+    requires: node.reproducible
+    ensures: node.reproducible = false
+}
+
+-- Infrastructure failure (crash, OOM kill, lost worker): retry while allowed.
+rule ComputationCrashes {
+    -- model: calc_graph.crash
+    when: ComputationCrashed(worker, node, reason)
+    requires: node.status = computing
+    ensures:
+        if node.attempts < config.max_attempts:
+            node.status = pending
+            node.dispatched_at = null
+        else:
+            node.status = failed
+            node.failure_reason = reason
+            node.failed_at = now
+            node.dispatched_at = null
+}
+
+-- Deterministic rejection (invalid inputs, model error): retrying is futile.
+rule ComputationRejects {
+    -- model: calc_graph.reject
+    when: ComputationRejected(worker, node, reason)
+    requires: node.status = computing
+    ensures:
+        node.status = failed
+        node.failure_reason = reason
+        node.failed_at = now
+        node.dispatched_at = null
+}
+
+rule ComputationTimesOut {
+    -- model: calc_graph.crash
+    when: node: CalculationNode.dispatched_at + config.compute_timeout <= now
+    requires: node.status = computing
+    ensures:
+        ComputationCrashed(worker: null, node: node, reason: "timeout")
+}
+
+rule StepCompletesWithNode {
+    -- model: calc_graph.stepDone
+    when: step: PlannedStep.node_available
+    requires: step.status = running
+    requires: not step.node_failed
+    ensures: step.status = done
+}
+
+-- Ringfence: a failure reaches only the steps bound to that node.
+rule StepFailsWithNode {
+    -- model: calc_graph.stepAbandon
+    when: step: PlannedStep.node_failed
+    requires: step.status = running
+    ensures: step.status = abandoned
+}
+
+-- Waiting steps that can no longer run are cancelled. Running siblings keep
+-- going: their nodes are shared and may serve other requests.
+rule StepCancelledWithRequest {
+    -- model: calc_graph.stepCancel
+    when: step: PlannedStep.request_failed
+    requires: step.status = waiting
+    ensures: step.status = cancelled
+}
+
+rule RequestCompletes {
+    -- model: calc_graph.requestFulfil
+    when: request: CalculationRequest.all_done
+    requires: request.status = open
+    requires: not request.any_abandoned
+    ensures:
+        request.status = fulfilled
+        request.completed_at = now
+}
+
+rule RequestFails {
+    -- model: calc_graph.requestFail
+    when: request: CalculationRequest.any_abandoned
+    requires: request.status = open
+    ensures:
+        request.status = unfulfilled
+        request.completed_at = now
+        request.failure_reason = "calculation step abandoned"
+}
+
+-- Cancellation by the requester, or by a batch operator for a batch run
+-- (D-038). Waiting steps are cancelled; running nodes finish, since they are
+-- shared and may serve other requests.
+rule CancelRequest {
+    -- model: calc_graph.cancel
+    when: RequestCancellationRequested(user, request)
+    requires: request.status = open
+    requires: user = request.requested_by
+        or data/permitted(user, "calc.cancel", request.origin_ref)
+    ensures:
+        request.status = unfulfilled
+        request.completed_at = now
+        request.failure_reason = "cancelled"
+}
+
+-- Up-front failure (D-008): an input with no version effective at as_of, as
+-- known at known_at, has no content hash, so no calc_id can exist. The planner
+-- reports it before any step or node is created.
+rule PlanningFails {
+    when: PlanningFailed(request, reason)
+    requires: request.status = open
+    requires: not request.plan_expanded
+    ensures:
+        request.status = unfulfilled
+        request.completed_at = now
+        request.failure_reason = reason
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant OneNodePerCalcId {
+    -- model: calc_graph.oneNodePerCalcId
+    for a in CalculationNodes:
+        for b in CalculationNodes:
+            a != b implies a.calc_id != b.calc_id
+}
+
+-- Data classes never mix: no test or synthetic input reaches a production
+-- result, and vice versa. The one-way whatif exception (D-038): a whatif node
+-- may read production inputs and nodes; nothing else reads whatif.
+invariant NodeInputsShareDataClass {
+    for n in CalculationNodes:
+        n.inputs.all(v => v.series.data_class = n.data_class
+            or (n.data_class = whatif and v.series.data_class = production))
+}
+
+invariant WhatifNeverLeaks {
+    for n in CalculationNodes:
+        n.data_class != whatif
+            implies n.prerequisite_nodes.all(p => p.data_class != whatif)
+}
+
+-- A production node's model came through a reviewed production release.
+invariant ProductionUsesReviewedModels {
+    for n in CalculationNodes:
+        n.data_class = production implies released_for_production(n.model)
+}
+
+invariant AttemptsBounded {
+    -- model: calc_graph.attemptsBounded
+    for n in CalculationNodes:
+        n.attempts <= config.max_attempts
+}
+
+-- No recomputation is in flight for a node already known irreproducible (D-062).
+invariant NoRecomputationOfIrreproducibleNode {
+    -- model: calc_graph.noRematOnBroken
+    for p in ResultPayloads:
+        p.recomputing implies p.node.reproducible
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Requester {
+    identified_by: data/User
+}
+
+-- The supervised Julia worker pool (04-julia-worker.allium).
+actor ComputeWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface CalculationRequests {
+    facing requester: Requester
+    context request: CalculationRequest where requested_by = requester
+
+    exposes:
+        request.status
+        request.as_of
+        request.known_at
+        for s in request.steps:
+            s.status
+
+    provides:
+        CalculationRequested(requester, model, subjects, data_class, as_of, known_at?, origin_ref?)
+        RequestCancellationRequested(requester, request) when request.status = open
+}
+
+surface ModelCatalogue {
+    facing requester: Requester
+    context model: ModelVersion
+
+    exposes:
+        model.function_name
+        model.version
+        model.code_hash
+        model.first_release.tag
+}
+
+surface WorkerProtocol {
+    facing worker: ComputeWorker
+    context node: CalculationNode where status = computing
+
+    exposes:
+        node.calc_id
+        node.model
+        node.as_of
+        node.inputs
+        node.prerequisite_nodes
+
+    provides:
+        ComputationSucceeded(worker, node, result_ref, result_hash)
+        ComputationCrashed(worker, node, reason)
+        ComputationRejected(worker, node, reason)
+
+    contracts:
+        demands DeterministicComputation
+
+    timeout:
+        ComputationTimesOut
+}
+
+surface WorkerRecomputation {
+    facing worker: ComputeWorker
+    context payload: ResultPayload where tier = purged
+
+    exposes:
+        payload.node.calc_id
+        payload.node.model
+        payload.node.as_of
+        payload.node.inputs
+
+    provides:
+        RematerialisationCompleted(worker, payload, result_ref, result_hash)
+
+    contracts:
+        demands DeterministicComputation
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black boxes owned by Julia (D-018), read by Elixir only as opaque data:
+--   planner_for(model)          planner model version for a function, from the
+--                               tagged configuration release
+--   plan_entries(node)          the DAG in a completed planning node's payload
+--   entry_model / entry_series / entry_prerequisites(e, request)
+--                               fields of one DAG entry; prerequisites map the
+--                               plan's local ids to this request's steps
+-- Black boxes owned by Elixir:
+--   resolvable(series, as_of, known_at), resolve_all(series_set, as_of,
+--   known_at), unresolved_series(entries, as_of, known_at): via
+--   data/resolve_version.
+--   calc_id_of(...), prerequisite_result_hashes(...), prerequisite_nodes(...):
+--   calc_id_of is a canonical, collision-resistant hash of hashes (D-018).
+--   node_class_of(step): the request's class, except in a whatif request
+--   where a step with no whatif input and no whatif prerequisite is
+--   production (D-038).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved: canonical rounding (D-004, D-015), up-front failure (D-008),
+-- development retention 7 days hot then 30 days cold, 37 days in total (D-005).
+open question "Is the stored payload itself canonically rounded, or kept at full precision with only result_hash computed on the rounded form?"open question "Provenance record: exactly which fields must an auditor see for a reported figure (requester, known_at, model code_hash, every input version, worker build)?"
+open question "A failed node is terminal for its calc_id. Should an operator be able to reset an infrastructure-failed node, given calc_id identity?"
+open question "Worker capacity and priority: how are dispatched nodes ordered when the bounded queue is full (e.g. regulatory EOD runs first)?"
+-- Resolved (D-062), found by the calculation-graph model (models/calc_graph.qnt, D-061): a purged payload is recomputed once however many steps wait for it (the payload carries a recomputing flag), and a step binding to an irreproducible node is abandoned at binding.
+open question "A recomputation that is lost (worker crash, timeout) never answers, so with the single recomputing flag (D-062) the waiting steps would wait for ever. A lost recomputation must clear the flag and be retried like a computation (max_attempts), and when attempts run out the steps waiting for the payload must fail. Not yet specified or modelled: confirm and add the rule and the model action."
