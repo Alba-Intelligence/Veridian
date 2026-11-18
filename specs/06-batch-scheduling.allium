@@ -21,12 +21,17 @@
 --   - Regulatory results are published only from a completed run; there is
 --     no partial publication (D-016).
 
+-- Split (D-070): this file holds schedules, runs, publication and capacity;
+--   06b-reruns-and-review reruns (reproduce, restate), restatement approval,
+--   and review of runs flagged for late data.
+
 use "./01-bitemporal-data.allium" as data
 use "./02-calculation-graph.allium" as graph
 use "./05-configuration-release.allium" as cfg
+use "./06b-reruns-and-review.allium" as rerun
 
 ------------------------------------------------------------
--- Enumerations
+-- Entities and Variants
 ------------------------------------------------------------
 
 -- What a reviewer of a flagged run can decide (D-051): accept it as is (with
@@ -34,10 +39,6 @@ use "./05-configuration-release.allium" as cfg
 -- restatement path with four-eyes, D-029), or escalate to risk control (the
 -- on-call rota, D-039).
 enum ReviewOutcome { accepted | restatement_required | escalated }
-
-------------------------------------------------------------
--- Entities and Variants
-------------------------------------------------------------
 
 entity BatchSchedule {
     name: String
@@ -295,121 +296,10 @@ rule PublishRun {
     ensures: RunPublication.created(run: run, published_at: now, state: in_effect)
 }
 
--- A restatement replaces a publication that may already have been sent to a
--- regulator: it needs a second person (D-029).
-rule RestatementAwaitsApproval {
-    when: RunReadyForPublication(run)
-    requires: run.status = completed
-    requires: run.rerun_mode = restate
-    ensures: RestatementApprovalRequested(run: run, owner: run.schedule.owner)
-}
-
-rule ApproveRestatement {
-    when: RestatementApproved(approver, run)
-    requires: run.status = completed
-    requires: run.rerun_mode = restate
-    requires: not exists run.publication
-    requires: approver != run.requested_by
-    requires: data/permitted(approver, "batch.approve_restatement", run.schedule.name)
-    requires: data/freshly_authenticated(approver)
-    ensures:
-        RunPublication.created(run: run, published_at: now, state: in_effect)
-        PublicationReplaced(previous: run.rerun_of)
-}
-
-rule ReplacePublication {
-    when: PublicationReplaced(previous)
-    requires: exists previous.publication
-    requires: previous.publication.state = in_effect
-    ensures:
-        previous.publication.state = replaced
-        previous.publication.replaced_at = now
-}
-
 rule DeadlineMissed {
     when: run: BatchRun.deadline <= now
     requires: run.status = running
     ensures: BatchDeadlineMissed(run: run, owner: run.schedule.owner)
-}
-
--- reproduce: same cut-off, proves the original result (audit, investigation).
--- restate: cut-off now, includes corrections made since; its publication
--- replaces the original's.
-rule RerunBatch {
-    when: RerunRequested(operator, run, mode, reason)
-    requires: run.status in {completed, failed}
-    requires: mode in {reproduce, restate}
-    requires: data/permitted(operator, "batch.rerun", run.schedule.name)
-    let cut = if mode = reproduce: run.cutoff else: now
-    let ref = rerun_ref_of(run, now)
-    ensures:
-        BatchRun.created(
-            run_ref: ref,
-            schedule: run.schedule,
-            cutoff: cut,
-            as_of: run.as_of,
-            started_at: now,
-            deadline: now + run.schedule.deadline_after,
-            requested_by: operator,
-            rerun_mode: mode,
-            rerun_of: run,
-            rerun_reason: reason,
-            status: running,
-            review_flag: false,
-            review_reason: null,
-            review_due_at: null,
-            reviewed_by: null,
-            review_outcome: null,
-            review_note: null
-        )
-        graph/CalculationRequested(
-            requester: operator,
-            model: run.schedule.model,
-            subjects: select_subjects(run.schedule, run.as_of, cut),
-            data_class: run.schedule.data_class,
-            as_of: run.as_of,
-            known_at: cut,
-            origin_ref: ref
-        )
-}
-
--- Data recorded after a completed run's cut-off, effective at its as_of, for
--- a series the run used: the run is flagged for review (D-025).
-rule FlagRunsAffectedByLateData {
-    when: data/InputChanged(series, version)
-    ensures:
-        for r in BatchRuns where status = completed and review_flag = false:
-            if run_used_series(r, series)
-                and effective_at(version, r.as_of)
-                and version.recorded_at > r.cutoff:
-                r.review_flag = true
-                r.review_reason = "input changed after cut-off"
-                r.review_due_at = projected_next_instant(r.schedule, now)
-                RunFlaggedForReview(run: r, cause: version, owner: r.schedule.owner)
-}
-
-rule ReviewFlaggedRun {
-    when: FlaggedRunReviewed(reviewer, run, outcome, note?)
-    requires: run.review_flag
-    requires: run.reviewed_by = null
-    requires: data/permitted(reviewer, "batch.review", run.schedule.name)
-    -- Accepting a flagged run as it is needs a written reason.
-    requires: outcome = accepted implies note != null
-    ensures:
-        run.reviewed_by = reviewer
-        run.review_outcome = outcome
-        run.review_note = note
-        if outcome = restatement_required:
-            RestatementRecommended(run: run, owner: run.schedule.owner)
-        if outcome = escalated:
-            FlaggedRunEscalatedToRiskControl(run: run, escalate_to: on_call_contact())
-}
-
-rule FlaggedRunReviewOverdue {
-    when: run: BatchRun.review_due_at <= now
-    requires: run.review_flag
-    requires: run.reviewed_by = null
-    ensures: FlaggedRunReviewEscalated(run: run, owner: run.schedule.owner)
 }
 
 ------------------------------------------------------------

@@ -1,0 +1,127 @@
+-- allium: 3
+-- 26b-pnl-restatement-and-review.allium
+
+-- Scope: What follows a computed P&L (D-069, part of 26): restatements that
+--   supersede it, its reported figures, and the product controller's view.
+-- Dependencies: 01, 06, 13, 26.
+
+use "./01-bitemporal-data.allium" as data
+use "./06-batch-scheduling.allium" as batch
+use "./13-report-review-alerts-trends.allium" as report
+use "./26-pnl-and-explain.allium" as pnl
+
+------------------------------------------------------------
+-- Rules, invariants and surfaces
+------------------------------------------------------------
+
+-- A restatement of a day changes that day's P&L and the next day's, which
+-- compares against it. Both are superseded, never edited: the old figures stay
+-- as they were published (D-029). The restated day's new P&L is started by its
+-- own publication (StartPnl); only the next day's is restarted here.
+rule SupersedeOnRestatement {
+    -- model: pnl_explain.restate
+    when: pub: batch/RunPublication.created
+    requires: pub.run.rerun_mode = restate
+    ensures:
+        for p in pnl/PnlRuns where status in {pending, computed, unavailable}
+                and (run = pub.run.rerun_of or prior_run = pub.run.rerun_of):
+            p.status = superseded
+        for p in pnl/PnlRuns where prior_run = pub.run.rerun_of:
+            PnlRestartWanted(run: p.run, node_ref: p.node_ref)
+}
+
+rule RestartPnl {
+    -- model: pnl_explain.restate
+    when: PnlRestartWanted(run, node_ref)
+    ensures:
+        pnl/PnlRun.created(
+            run: run,
+            prior_run: prior_published_run(run),
+            node_ref: node_ref,
+            as_of: run.as_of,
+            currency: reporting_currency(node_ref),
+            status: if prior_published_run(run) = null: unavailable else: pending
+        )
+}
+
+-- Reported figures: the three P&Ls and each component, retained like any (13).
+-- They are recorded once the residual is within tolerance or accepted, so the
+-- publication's sign-off (13) is not bypassed by figures that arrive later
+-- and nobody reviewed: until then they are visible to product control only.
+rule RecordPnlFigures {
+    when: pnl/PnlReleasable(pnl_run)
+    let p = pnl_run
+    requires: p.status = computed
+    let pub = p.run.publication
+    requires: exists pub
+    ensures:
+        for f in p.figures:
+            report/ReportedFigure.created(
+                publication: pub,
+                figure_key: p.node_ref + "/pnl/" + f.kind,
+                as_of: p.as_of, value: f.value, currency: p.currency,
+                data_class: production, source_calc_id: f.source_calc_id,
+                recorded_at: now, retained_until: figure_retention(pub)
+            )
+        for c in p.components:
+            report/ReportedFigure.created(
+                publication: pub,
+                figure_key: p.node_ref + "/pnl/" + c.basis + "/" + c.component
+                    + (if c.risk_class != null: "/" + c.risk_class else: ""),
+                as_of: p.as_of, value: c.value, currency: p.currency,
+                data_class: production, source_calc_id: c.source_calc_id,
+                recorded_at: now, retained_until: figure_retention(pub)
+            )
+}
+
+invariant OneCurrentPnlRun {
+    -- model: pnl_explain.oneCurrent
+    for a in pnl/PnlRuns where status in {pending, computed, unavailable}:
+        for b in pnl/PnlRuns where status in {pending, computed, unavailable}:
+            a != b implies not (a.as_of = b.as_of and a.node_ref = b.node_ref)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ProductController {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface PnlReview {
+    facing controller: ProductController
+    context p: pnl/PnlRun where status in {computed, superseded}
+
+    exposes:
+        p.node_ref
+        p.as_of
+        p.status
+        for f in p.figures:
+            f.kind
+            f.value
+        for c in p.components:
+            c.basis
+            c.component
+            c.risk_class
+            c.value
+        p.finding.hpl
+        p.finding.rtpl
+        p.finding.residual
+        p.finding.tolerance_abs
+        p.finding.tolerance_rel
+        p.finding.disposition
+        p.finding.explanation
+        p.finding.accepted_by
+
+    provides:
+        ResidualAccepted(controller, p.finding, explanation) when p.finding.disposition = open
+}
+
+
+-- Black boxes: figure_retention(publication), pnl_ref, platform_service: as in
+-- 26 and 13.

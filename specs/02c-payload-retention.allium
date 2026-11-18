@@ -1,0 +1,226 @@
+-- allium: 3
+-- 02c-payload-retention.allium
+
+-- Scope: Result payload ageing (hot, cold, purged) and recomputation of a
+--   purged payload, which must reproduce the node's result_hash (D-005, D-062,
+--   D-063). Part of the calculation graph (02-calculation-graph).
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./02d-attempts-and-inspection.allium" as insp
+use "./02b-node-execution.allium" as exec
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Result payload storage (D-005). The node (provenance and result_hash) is
+-- kept; only the payload ages out. A purged payload is recomputed on demand
+-- and must reproduce the node's result_hash.
+entity ResultPayload {
+    node: graph/CalculationNode
+    tier: hot | cold | purged
+    tier_since: Timestamp
+    result_ref: String when tier = hot | cold
+    -- True while a recomputation of this purged payload is dispatched and not
+    -- yet answered (D-062): later steps attach to it, no second one is sent.
+    recomputing: Boolean
+    -- Dispatches of the current recomputation cycle (D-063), counted apart from
+    -- the node's own attempts. 0 when no cycle is running.
+    recompute_attempts: Integer
+    -- When a worker took the current dispatch; null while it queues.
+    recompute_started_at: Timestamp?
+
+    transitions tier {
+        hot -> cold
+        cold -> purged
+        purged -> hot
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Development values (D-005); production values configured later.
+    hot_retention: Duration = 7.days
+    cold_retention: Duration = 30.days
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule PayloadMovesToColdStorage {
+    -- model: calc_graph.cool
+    when: payload: ResultPayload.tier_since + config.hot_retention <= now
+    requires: payload.tier = hot
+    ensures:
+        payload.tier = cold
+        payload.tier_since = now
+}
+
+rule PayloadPurged {
+    -- model: calc_graph.purge
+    when: payload: ResultPayload.tier_since + config.cold_retention <= now
+    requires: payload.tier = cold
+    -- A payload is not aged out under a step that is still running on its node
+    -- (D-063): that step would otherwise find a purged payload with no
+    -- recomputation started for it.
+    requires: payload.node.steps.none(s => s.status = running)
+    ensures:
+        payload.tier = purged
+        payload.tier_since = now
+        payload.result_ref = null
+}
+
+-- A purged result is needed again: recompute it and prove determinism by
+-- matching the recorded result_hash. Stampede control applies: concurrent
+-- requests for the same purged payload trigger one recomputation: the first
+-- step binding to the payload sets `recomputing` (StepBindsToNode), so this
+-- rule fires once per recomputation (D-062).
+rule RematerialisationDispatched {
+    -- model: calc_graph.bindExisting calc_graph.oneRematInFlight
+    when: exec/RematerialisationRequested(payload)
+    requires: payload.tier = purged
+    ensures: RecomputationDispatched(payload: payload)
+}
+
+rule RematerialisationSucceeds {
+    -- model: calc_graph.rematAnswer
+    when: RematerialisationCompleted(worker, payload, result_ref, result_hash)
+    requires: payload.tier = purged
+    requires: payload.node.status = complete
+    ensures:
+        payload.recomputing = false
+        payload.recompute_attempts = 0
+        payload.recompute_started_at = null
+        if result_hash = payload.node.result_hash:
+            payload.tier = hot
+            payload.tier_since = now
+            payload.result_ref = result_ref
+        -- Only the answering worker's own attempt is closed: a late answer from
+        -- a worker given up on (D-063) must not close the retry's attempt.
+        for a in payload.node.attempt_log:
+            if a.outcome = running and a.worker = worker.identity:
+                a.ended_at = now
+                a.result_hash = result_hash
+                if result_hash = payload.node.result_hash:
+                    a.outcome = succeeded
+                else:
+                    a.outcome = mismatched
+                    -- The breach names whether the rerun used another
+                    -- environment than the one recorded for the node (D-064),
+                    -- so a reviewer sees which side to suspect first (new build
+                    -- or model). It never excuses the mismatch (D-064).
+                    ReproducibilityBreachDetected(
+                        node: payload.node,
+                        observed_hash: result_hash,
+                        environment_differs: a.environment != payload.node.computed_by.environment
+                    )
+}
+
+-- As for a computation, the timeout runs from the moment a worker takes the
+-- recomputation, not from dispatch (D-063).
+rule RecomputationStartsOnWorker {
+    when: RecomputationAssigned(payload, worker, environment)
+    requires: payload.recomputing
+    ensures:
+        payload.recompute_started_at = now
+        insp/ComputationAttempt.created(
+            node: payload.node,
+            sequence: payload.node.attempt_log.count + 1,
+            purpose: recomputation,
+            worker: worker,
+            environment: environment,
+            started_at: now,
+            outcome: running
+        )
+}
+
+-- A lost recomputation (worker crash, lost host, timeout) is retried like a
+-- computation, with its own attempt count and the same cap (D-063). When the
+-- attempts run out the cycle ends: the steps waiting for the payload are
+-- abandoned, and the node stays complete and reproducible, because losing a
+-- worker is infrastructure, not a breach. A later step binding to the payload
+-- starts a fresh cycle (StepBindsToNode). A late answer from a worker given up
+-- on is handled by RematerialisationSucceeds: the same hash is harmless, a
+-- different hash is a real breach, and an answer for a payload that is no longer
+-- purged is dropped.
+rule RecomputationCrashes {
+    -- model: calc_graph.rematCrash calc_graph.purgedWaiterHasRemat
+    when: RecomputationCrashed(worker, payload, reason, log_excerpt?)
+    requires: payload.tier = purged
+    requires: payload.recomputing
+    ensures:
+        -- worker is null for a timeout: it ends the current dispatch.
+        for a in payload.node.attempt_log:
+            if a.outcome = running and (worker = null or a.worker = worker):
+                a.outcome = crashed
+                a.ended_at = now
+                a.reason = reason
+                a.log_excerpt = bounded(log_excerpt, insp/config.max_log_excerpt)
+        if payload.recompute_attempts < graph/config.max_attempts:
+            payload.recompute_attempts = payload.recompute_attempts + 1
+            payload.recompute_started_at = null
+            RecomputationDispatched(payload: payload)
+        else:
+            payload.recomputing = false
+            payload.recompute_attempts = 0
+            payload.recompute_started_at = null
+            for s in payload.node.steps:
+                if s.status = running:
+                    s.status = abandoned
+}
+
+rule RecomputationTimesOut {
+    -- model: calc_graph.rematCrash
+    when: payload: ResultPayload.recompute_started_at + graph/config.compute_timeout <= now
+    requires: payload.recomputing
+    ensures: RecomputationCrashed(worker: null, payload: payload, reason: "timeout", log_excerpt: null)
+}
+
+-- A breach is a model-risk incident: the node can no longer serve results.
+rule MarkNodeIrreproducible {
+    -- model: calc_graph.rematAnswer
+    when: ReproducibilityBreachDetected(node, observed_hash, environment_differs)
+    requires: node.reproducible
+    ensures: node.reproducible = false
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- No recomputation is in flight for a node already known irreproducible (D-062).
+invariant NoRecomputationOfIrreproducibleNode {
+    -- model: calc_graph.noRematOnBroken
+    for p in ResultPayloads:
+        p.recomputing implies p.node.reproducible
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface WorkerRecomputation {
+    facing worker: ComputeWorker
+    context payload: ResultPayload where tier = purged
+
+    exposes:
+        payload.node.calc_id
+        payload.node.model
+        payload.node.as_of
+        payload.node.inputs
+
+    provides:
+        RematerialisationCompleted(worker, payload, result_ref, result_hash)
+        RecomputationCrashed(worker, payload, reason, log_excerpt?)
+
+    contracts:
+        demands DeterministicComputation
+
+    timeout:
+        RecomputationTimesOut
+}

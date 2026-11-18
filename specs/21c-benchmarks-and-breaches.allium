@@ -1,0 +1,149 @@
+-- allium: 3
+-- 21c-benchmarks-and-breaches.allium
+
+-- Scope: Benchmark runs against independent results, and the breaches they
+--   raise and their review. Part of 21.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./13-report-review-alerts-trends.allium" as review
+use "./13b-alerts.allium" as alerts
+use "./21-model-risk-management.allium" as mrm
+use "./21b-model-validation.allium" as val
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- One scheduled comparison with the independent reference.
+entity BenchmarkRun {
+    entry: mrm/ModelInventoryEntry
+    validation: val/ModelValidation
+    cases: Integer
+    max_difference: Decimal
+    tolerance: Decimal
+    within_tolerance: Boolean
+    run_at: Timestamp
+}
+
+-- A benchmark outside tolerance. While open, no production release carrying
+-- the model can be activated.
+entity ModelBreach {
+    entry: mrm/ModelInventoryEntry
+    benchmark: BenchmarkRun
+    raised_at: Timestamp
+    reviewed_by: data/User?
+    review_note: String?
+    state: open | reviewed
+
+    transitions state {
+        open -> reviewed
+        terminal: reviewed
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Benchmarking: scheduled by tier against the independent reference.
+rule BenchmarkDue {
+    when: entry: mrm/ModelInventoryEntry.next_benchmark_due <= now
+    requires: entry.status = in_inventory
+    ensures: BenchmarkRequested(entry: entry)
+}
+
+rule RecordBenchmark {
+    when: BenchmarkRecorded(worker, entry, validation, cases, max_difference)
+    requires: validation.entry = entry
+    requires: validation.state = current
+    requires: data/permitted(worker, "model.benchmark", entry.function_name)
+    ensures:
+        BenchmarkRun.created(
+            entry: entry,
+            validation: validation,
+            cases: cases,
+            max_difference: max_difference,
+            tolerance: validation.benchmark_tolerance,
+            within_tolerance: max_difference <= validation.benchmark_tolerance,
+            run_at: now
+        )
+        entry.next_benchmark_due = now + benchmark_interval(entry.tier)
+}
+
+rule RaiseBreach {
+    -- model: release_gate.benchmarkOutside
+    when: run: BenchmarkRun.created
+    requires: not run.within_tolerance
+    ensures:
+        ModelBreach.created(
+            entry: run.entry,
+            benchmark: run,
+            raised_at: now,
+            state: open
+        )
+        alerts/Alert.created(
+            source: run_problem,
+            subject_ref: run.entry.function_name,
+            description: "model benchmark outside tolerance",
+            raised_at: now,
+            owner: run.entry.owner,
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule ReviewBreach {
+    -- model: release_gate.reviewBreach
+    when: BreachReviewed(reviewer, breach, note)
+    requires: breach.state = open
+    requires: data/permitted(reviewer, "model.validate", breach.entry.function_name)
+    requires: reviewer != breach.entry.owner
+    requires: data/freshly_authenticated(reviewer)
+    ensures:
+        breach.state = reviewed
+        breach.reviewed_by = reviewer
+        breach.review_note = note
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ReviewerIsIndependent {
+    -- model: release_gate.reviewerIndependent
+    for b in ModelBreachs:
+        b.state = reviewed implies b.reviewed_by != b.entry.owner
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ModelBreaches {
+    facing validator: mrm/ModelValidator
+    context breach: ModelBreach
+
+    exposes:
+        breach.entry.function_name
+        breach.benchmark.max_difference
+        breach.benchmark.tolerance
+        breach.raised_at
+        breach.state
+
+    provides:
+        BreachReviewed(validator, breach, note) when breach.state = open
+}
+
+surface BenchmarkComputation {
+    facing worker: mrm/BenchmarkWorker
+
+    provides:
+        BenchmarkRecorded(worker, entry, validation, cases, max_difference)
+
+    @guarantee ReferenceIsIndependent
+        -- The worker's reference values come from the independent
+        -- implementation, with its inputs frozen (D-049); a benchmark that
+        -- used the model's own code is not accepted.
+}

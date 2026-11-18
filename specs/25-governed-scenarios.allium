@@ -1,0 +1,287 @@
+-- allium: 3
+-- 25-governed-scenarios.allium
+
+-- Scope: The register of versioned, approved scenario sets, historical and
+--   hypothetical (D-068, gap review item 2).
+-- Includes: sets, versions, their approval, retirement and scheduling flag.
+--   Their application to a perimeter (stress runs, results, figures) is in
+--   25b-stress-runs.
+-- Excludes:
+--   - The three correlation scenarios of the capital charge (11): they are
+--     part of the method, not governed scenario sets (open question).
+--   - How a shock is applied to a market object and a position revalued: a
+--     Julia model in a release (07, 08, 09, 17, 18).
+--   - A trader's private what-if (14): own series, never shared.
+--   - Expected shortfall and P&L attribution tests for internal models (D-002).
+-- Dependencies: 01, 04.
+--
+-- Why: a bank runs the same named stresses every day, answers to the
+-- regulator for how they were defined, and must reproduce a stress figure
+-- years later. A scenario is therefore data under governance, not code.
+--
+-- The rules (user choices, D-068):
+--   - A scenario set has its own register and its own approval, outside
+--     configuration releases: an owner drafts a version, someone else
+--     approves it, an approved version never changes, a new version replaces
+--     it, an old one is retired.
+--   - Version content, by kind. Hypothetical: shocks by risk factor.
+--     Historical: a window of dates, and the knowledge time at which the
+--     market data of those dates is read, frozen when the version is
+--     submitted, so the stress reproduces whatever is corrected later.
+--   - A stress run revalues every position of the perimeter under each
+--     scenario with the production models, as an overlay on its inputs (not a
+--     new series), and subtracts the base value. Approval records the version's
+--     definition as an input version (01); every stress request pins it as an
+--     input, so the calc_id of a scenario node differs from the base node's and
+--     from other versions' through the input hashes (02), and is memoized.
+--   - Scheduled stress runs are part of a batch run (06) of the approved
+--     versions the approver marked scheduled, and are durable. Users may also
+--     run any approved version on any perimeter they may see: those nodes
+--     are ephemeral (23) and are adopted by a durable run that reaches the same
+--     calc_id. Ad-hoc results are unofficial, as in 14.
+
+use "./01-bitemporal-data.allium" as data
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity ScenarioSet {
+    name: String
+    kind: historical | hypothetical
+    owner: data/User
+    description: String
+    created_at: Timestamp
+    status: active | closed
+
+    transitions status {
+        active -> closed
+        terminal: closed
+    }
+
+    versions: ScenarioVersion with scenario_set = this
+}
+
+entity ScenarioVersion {
+    scenario_set: ScenarioSet
+    number: Integer
+    -- Hash of the whole definition: scenario names, shocks or windows, and
+    -- for a historical set the frozen knowledge time. It enters the calc_id.
+    content_hash: String
+    scenario_names: Set<String>
+    -- Historical sets only: the knowledge time of the market data read.
+    data_known_at: Timestamp? when scenario_set.kind = historical
+    authored_by: data/User
+    status: draft | submitted | approved | rejected | retired
+    submitted_at: Timestamp when status = submitted | approved | retired
+    approved_by: data/User when status = approved | retired
+    approved_at: Timestamp when status = approved | retired
+    -- The definition as an immutable input version, recorded at approval.
+    definition_input: data/InputVersion when status = approved | retired
+    -- Chosen at approval: stress run in every batch run (06).
+    scheduled: Boolean
+    rejection_reason: String? when status = rejected
+    retired_at: Timestamp when status = retired
+
+    transitions status {
+        draft -> submitted
+        submitted -> approved
+        submitted -> rejected
+        approved -> retired
+        terminal: rejected, retired
+    }
+}
+
+------------------------------------------------------------
+-- Rules: the register
+------------------------------------------------------------
+
+rule CreateScenarioSet {
+    when: ScenarioSetCreated(author, name, kind, description)
+    requires: data/permitted(author, "scenario.author", name)
+    requires: not exists ScenarioSet{name: name, status: active}
+    ensures: ScenarioSet.created(
+        name: name,
+        kind: kind,
+        owner: author,
+        description: description,
+        created_at: now,
+        status: active
+    )
+}
+
+-- A draft is edited freely by its author; nothing else reads it.
+rule DraftVersion {
+    -- model: scenario_register.draft
+    when: VersionDrafted(author, scenario_set, scenario_names, definition_hash, data_known_at?)
+    requires: scenario_set.status = active
+    requires: data/permitted(author, "scenario.author", scenario_set.name)
+    requires: scenario_set.kind = historical implies data_known_at != null
+    ensures: ScenarioVersion.created(
+        scenario_set: scenario_set,
+        number: scenario_set.versions.count + 1,
+        content_hash: definition_hash,
+        scenario_names: scenario_names,
+        data_known_at: data_known_at,
+        authored_by: author,
+        status: draft,
+        scheduled: false
+    )
+}
+
+-- Submitting fixes the content, and for a historical set the knowledge time,
+-- which cannot be in the future.
+rule SubmitVersion {
+    -- model: scenario_register.submit
+    when: VersionSubmitted(author, version)
+    requires: version.status = draft
+    requires: version.authored_by = author
+    requires: version.scenario_set.kind = hypothetical
+        or version.data_known_at <= now
+    ensures:
+        version.status = submitted
+        version.submitted_at = now
+}
+
+-- Four eyes: never the author of the version.
+rule ApproveVersion {
+    -- model: scenario_register.approve
+    when: VersionApproved(approver, version, scheduled)
+    requires: version.status = submitted
+    requires: data/permitted(approver, "scenario.approve", version.scenario_set.name)
+    requires: approver != version.authored_by
+    ensures:
+        version.status = approved
+        version.approved_by = approver
+        version.approved_at = now
+        version.definition_input = record_definition(version)
+        version.scheduled = scheduled
+}
+
+rule RejectVersion {
+    -- model: scenario_register.reject
+    when: VersionRejected(approver, version, reason)
+    requires: version.status = submitted
+    requires: data/permitted(approver, "scenario.approve", version.scenario_set.name)
+    requires: approver != version.authored_by
+    ensures:
+        version.status = rejected
+        version.rejection_reason = reason
+}
+
+-- Retiring stops new runs and scheduled runs; old results stay and still
+-- reproduce, because the version is never removed.
+rule RetireVersion {
+    -- model: scenario_register.retire
+    when: VersionRetired(owner, version)
+    requires: version.status = approved
+    requires: owner = version.scenario_set.owner
+        or data/permitted(owner, "scenario.approve", version.scenario_set.name)
+    ensures:
+        version.status = retired
+        version.retired_at = now
+        version.scheduled = false
+}
+
+-- Approving a version as scheduled retires any other scheduled version of the
+-- set, whatever its number, so a set is stressed once a day.
+rule ReplaceScheduledVersion {
+    -- model: scenario_register.approve
+    when: v: ScenarioVersion.status becomes approved
+    requires: v.scheduled
+    ensures:
+        for old in v.scenario_set.versions where status = approved and scheduled and number != v.number:
+            old.status = retired
+            old.retired_at = now
+            old.scheduled = false
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Never the author who approves.
+invariant ApproverIsNotAuthor {
+    -- model: scenario_register.approverIndependent
+    for v in ScenarioVersions:
+        v.status in {approved, retired} implies v.approved_by != v.authored_by
+}
+
+-- Only an approved version is scheduled.
+invariant ScheduledMeansApproved {
+    -- model: scenario_register.scheduledApproved
+    for v in ScenarioVersions:
+        v.scheduled implies v.status = approved
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ScenarioOwner {
+    identified_by: data/User
+}
+
+actor ScenarioApprover {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ScenarioRegister {
+    facing owner: ScenarioOwner
+    context set: ScenarioSet where owner = owner
+
+    exposes:
+        set.name
+        set.kind
+        set.status
+        for v in set.versions:
+            v.number
+            v.status
+            v.content_hash
+            v.scheduled
+            v.rejection_reason
+
+    provides:
+        VersionDrafted(owner, set, scenario_names, definition_hash, data_known_at?) when set.status = active
+        VersionSubmitted(owner, version) when version.status = draft
+        VersionRetired(owner, version) when version.status = approved
+}
+
+surface ScenarioApproval {
+    facing approver: ScenarioApprover
+    context version: ScenarioVersion where status = submitted
+
+    exposes:
+        version.scenario_set.name
+        version.number
+        version.scenario_names
+        version.content_hash
+        version.data_known_at
+
+    provides:
+        VersionApproved(approver, version, scheduled)
+        VersionRejected(approver, version, reason)
+}
+
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Running a version on a perimeter, results and figures: 25b-stress-runs.
+-- record_definition(version): records the definition (content_hash, scenario
+-- names, shocks or windows, frozen knowledge time) as an input version (01).
+-- The shock itself is applied by a Julia model of the release (08), reading
+-- production inputs only and the version's definition, never the register.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Should the three correlation scenarios of the capital charge (11) become a governed set, so one register holds every named stress?"
+open question "May an approver of a set also approve a retirement of a set another approver approved, and who closes a set (status closed)?"
+open question "Historical windows read market data at a frozen knowledge time: when that data is corrected later, should the owner be told that a newer version would differ?"

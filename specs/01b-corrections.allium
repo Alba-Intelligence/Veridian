@@ -1,0 +1,173 @@
+-- allium: 3
+-- 01b-corrections.allium
+
+-- Scope: Corrections to input versions: proposal, approval and rejection, in
+--   batches, and the handling of corrections that went stale. Part of 01.
+
+use "./01-bitemporal-data.allium" as bt
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Many corrections reviewed and approved in one action (D-051): fixing a week
+-- of curves at once. Each member stays an ordinary correction with one target,
+-- one lineage and its own approval record; the batch only groups the review.
+-- It is approved or rejected as a whole.
+entity CorrectionBatch {
+    submitted_by: bt/User
+    submitted_at: Timestamp
+    corrections: Set<bt/InputVersion>
+    approved_by: bt/User? when status = approved
+    rejection_reason: String when status = declined
+    status: awaiting_review | approved | declined
+
+    transitions status {
+        awaiting_review -> approved
+        awaiting_review -> declined
+        terminal: approved, declined
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A correction replaces all or part of an active version; it waits for a
+-- second person. Golden data is corrected exactly like production (D-007).
+-- Its effective range must lie within the target's range (D-006).
+rule ProposeCorrection {
+    when: bt/CorrectionProposed(submitter, target, content_hash, effective_from, effective_to?)
+    requires: target.status = active
+    requires: permitted(submitter, "input.correct", target.series)
+    requires: effective_from >= target.effective_from
+    requires: target.effective_to = null
+        or (effective_to != null and effective_to <= target.effective_to)
+    ensures: bt/InputVersion.created(
+        series: target.series,
+        content_hash: content_hash,
+        effective_from: effective_from,
+        effective_to: effective_to,
+        submitted_by: submitter,
+        submitted_at: now,
+        supersedes: target,
+        origin: correction,
+        carried_from: null,
+        status: proposed
+    )
+}
+
+rule ApproveCorrection {
+    when: CorrectionApproved(approver, correction)
+    requires: correction.status = proposed
+    requires: correction.supersedes != null
+    requires: correction.supersedes.status = active
+    requires: approver != correction.submitted_by
+    requires: permitted(approver, "input.approve_correction", correction.series)
+    requires: freshly_authenticated(approver)
+    ensures:
+        correction.status = active
+        correction.recorded_at = now
+        correction.approved_by = approver
+        VersionReplaced(replacement: correction, previous: correction.supersedes)
+}
+
+rule RejectCorrection {
+    when: CorrectionRejected(reviewer, correction, reason)
+    requires: correction.status = proposed
+    requires: reviewer != correction.submitted_by
+    requires: permitted(reviewer, "input.approve_correction", correction.series)
+    requires: freshly_authenticated(reviewer)
+    ensures:
+        correction.status = rejected
+        correction.rejected_by = reviewer
+        correction.rejection_reason = reason
+}
+
+-- A correction waiting for approval whose target has since been superseded
+-- (by another correction, a succession or a source correction) can never be
+-- approved. It is closed at once with the reason and its author is told, who
+-- proposes again against the current version if the fix is still needed; it
+-- is never re-targeted, so an approver only ever approves what they saw
+-- (D-051).
+rule FindStaleCorrections {
+    when: VersionReplaced(replacement, previous)
+    ensures:
+        for c in pending_corrections_of(previous):
+            StaleCorrectionFound(correction: c)
+}
+
+rule RejectStaleCorrection {
+    when: StaleCorrectionFound(correction)
+    requires: correction.status = proposed
+    ensures:
+        correction.status = rejected
+        correction.rejection_reason = "target superseded while the correction was pending"
+        StaleCorrectionRejected(correction: correction, author: correction.submitted_by)
+}
+
+-- Batches (D-051). Members were proposed one by one, each against its own
+-- target; the batch is one review and one approval action, and every member
+-- is approved or rejected through the ordinary rules, so lineage is per
+-- version.
+rule ProposeCorrectionBatch {
+    when: bt/CorrectionBatchProposed(submitter, corrections)
+    requires: corrections.count >= 2
+    requires: corrections.all(c => c.status = proposed and c.submitted_by = submitter)
+    ensures: CorrectionBatch.created(
+        submitted_by: submitter,
+        submitted_at: now,
+        corrections: corrections,
+        status: awaiting_review
+    )
+}
+
+rule ApproveCorrectionBatch {
+    when: bt/CorrectionBatchApproved(approver, batch)
+    requires: batch.status = awaiting_review
+    requires: approver != batch.submitted_by
+    requires: batch.corrections.all(c => c.status = proposed
+        and c.supersedes.status = active
+        and permitted(approver, "input.approve_correction", c.series))
+    requires: freshly_authenticated(approver)
+    ensures:
+        batch.status = approved
+        batch.approved_by = approver
+        for c in batch.corrections:
+            CorrectionApproved(approver: approver, correction: c)
+}
+
+rule RejectCorrectionBatch {
+    when: bt/CorrectionBatchRejected(reviewer, batch, reason)
+    requires: batch.status = awaiting_review
+    requires: reviewer != batch.submitted_by
+    requires: batch.corrections.all(c => permitted(reviewer, "input.approve_correction", c.series))
+    requires: freshly_authenticated(reviewer)
+    ensures:
+        batch.status = declined
+        batch.rejection_reason = reason
+        for c in batch.corrections:
+            CorrectionRejected(reviewer: reviewer, correction: c, reason: reason)
+}
+
+-- A batch is all or nothing: when one member goes stale the rest of the batch
+-- is closed with it, and the author proposes again.
+rule RejectBatchOfStaleMember {
+    when: StaleCorrectionRejected(correction, author)
+    let batch = batch_containing(correction)
+    requires: batch != null
+    requires: batch.status = awaiting_review
+    ensures:
+        batch.status = declined
+        batch.rejection_reason = "a member correction became stale"
+        for c in batch.corrections:
+            CorrectionDroppedWithBatch(correction: c)
+}
+
+rule DropBatchMember {
+    when: CorrectionDroppedWithBatch(correction)
+    requires: correction.status = proposed
+    ensures:
+        correction.status = rejected
+        correction.rejection_reason = "its batch was rejected"
+}

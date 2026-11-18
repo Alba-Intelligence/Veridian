@@ -136,7 +136,7 @@ module release_gate {
 
   // A validator who is neither the owner nor the author of the release that
   // carried the version; a new validation replaces the previous one.
-  // spec: 21-model-risk-management#RecordValidation
+  // spec: 21b-model-validation#RecordValidation
   action recordValidation(m: str, v: str): bool = all {
     VALIDATORS.contains(v),
     v != OWNER.get(m),
@@ -149,7 +149,7 @@ module release_gate {
     breachReviewer' = breachReviewer,
   }
 
-  // spec: 21-model-risk-management#ValidationExpires
+  // spec: 21b-model-validation#ValidationExpires
   action expire(m: str): bool = all {
     valSt.get(m) == Current,
     changes' = changes,
@@ -160,7 +160,7 @@ module release_gate {
     breachReviewer' = breachReviewer,
   }
 
-  // spec: 21-model-risk-management#WithdrawValidation
+  // spec: 21b-model-validation#WithdrawValidation
   action withdraw(m: str, v: str): bool = all {
     valSt.get(m) == Current,
     VALIDATORS.contains(v),
@@ -173,7 +173,7 @@ module release_gate {
   }
 
   // A benchmark outside tolerance opens a breach (it needs a current validation).
-  // spec: 21-model-risk-management#RaiseBreach
+  // spec: 21c-benchmarks-and-breaches#RaiseBreach
   action benchmarkOutside(m: str): bool = all {
     valSt.get(m) == Current,
     changes' = changes,
@@ -183,7 +183,7 @@ module release_gate {
     clearedAtActivation' = clearedAtActivation, breachReviewer' = breachReviewer,
   }
 
-  // spec: 21-model-risk-management#ReviewBreach
+  // spec: 21c-benchmarks-and-breaches#ReviewBreach
   action reviewBreach(m: str, v: str): bool = all {
     breach.get(m) == Open,
     VALIDATORS.contains(v),
@@ -232,13 +232,13 @@ module release_gate {
     if (relSt.get(r) == Active or relSt.get(r) == Superseded) clearedAtActivation.get(r)
     else true)
 
-  // spec: 21-model-risk-management#ValidatorIsIndependent
+  // spec: 21b-model-validation#ValidatorIsIndependent
   val validatorIndependent = MODELS.forall(m =>
     if (valSt.get(m) != NoVal)
       validator.get(m) != OWNER.get(m) and validator.get(m) != FIRST_AUTHOR.get(m)
     else true)
 
-  // spec: 21-model-risk-management#ReviewerIsIndependent
+  // spec: 21c-benchmarks-and-breaches#ReviewerIsIndependent
   val reviewerIndependent = MODELS.forall(m =>
     if (breach.get(m) == Reviewed) breachReviewer.get(m) != OWNER.get(m) else true)
 

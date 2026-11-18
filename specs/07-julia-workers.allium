@@ -34,11 +34,19 @@
 --     Julia worker pool on a precompiled system image) starts inside it and
 --     joins the cluster. Slurm supplies machines; it never schedules
 --     calculations. Static hosts may also join without an allocation.
+-- Split (D-070): 07-julia-workers holds contracts, worker builds, worker
+--   processes and tickets and the worker start-up rules; 07b-compute-hosts the
+--   host supply contract and host lifecycle; 07c-host-allocation grid
+--   allocations and scaling; 07d-job-dispatch the queue, assignment, bundles and
+--   worker death.
 
 use "./01-bitemporal-data.allium" as data
 use "./02-calculation-graph.allium" as graph
+use "./02c-payload-retention.allium" as ret
 use "./05-configuration-release.allium" as cfg
 use "./06-batch-scheduling.allium" as batch
+use "./07b-compute-hosts.allium" as hosts
+use "./07d-job-dispatch.allium" as disp
 
 ------------------------------------------------------------
 -- Contracts
@@ -126,64 +134,6 @@ contract JobGranularity {
         -- Dagger cluster mode across hosts: distribution is the graph's job.
 }
 
-contract HostSupply {
-    submit_allocation: (reason: String, max_workers: Integer) -> String
-    release_allocation: (scheduler_ref: String) -> Boolean
-
-    @invariant SchedulerSuppliesHostsOnly
-        -- The grid scheduler (Slurm) receives requests for long-running host
-        -- allocations, never individual calculations. Account, partition,
-        -- quality of service and walltime are configuration artefacts (D-027).
-
-    @invariant EodPeakCapacity
-        -- Regulatory EOD runs ask for their peak as one batch of hosts (a
-        -- Slurm job array) under a higher quality of service; other demand
-        -- asks for one host at a time (D-039).
-
-    @invariant EodArrayBeforeCutoff
-        -- The array is requested config.capacity_lead (06) before the run's
-        -- cut-off, so the grid's wait is not part of the run's deadline
-        -- (D-045). Preempting running hosts is the fallback, not the plan:
-        -- in the spike it took the scheduler 11-34 s to act.
-
-    @invariant EvictionOnFirstSignal
-        -- A host told to stop (preemption or walltime warning) stops taking
-        -- jobs on the first signal and does not rely on the scheduler's grace
-        -- period: in the spike the preempting job started on the node before
-        -- the victim had drained, and the walltime warning came earlier than
-        -- asked (D-045).
-
-    @invariant LivenessFromHeartbeat
-        -- model: bundled_dispatch.receive
-        -- Whether a host is alive is decided by the control plane's own
-        -- heartbeat (config.heartbeat_timeout), never by the scheduler's job
-        -- or node state, which lagged 47-49 s behind a frozen host in the
-        -- spike (D-037, D-045). A scheduler report that a job ended is
-        -- accepted at once as HostDown. Results reported after a host was
-        -- declared lost are ignored: its tickets are already finished.
-
-    @invariant NetworkPath
-        -- Grid hosts join over Erlang distribution with TLS on fixed ports;
-        -- where the bank's firewall forbids inbound connections to grid
-        -- nodes, an outbound-only host agent is used instead (D-039).
-
-    @invariant SameCodePathEverywhere
-        -- A developer laptop runs the same allocation flow against a
-        -- simulated Slurm cluster (several simulated nodes, defined as code in
-        -- the development environment); production differs only in
-        -- configuration.
-
-    @invariant FailureInjection
-        -- The simulation can reproduce refusal, long queueing, cancellation,
-        -- preemption, walltime expiry and node loss, so the rules below are
-        -- tested end to end.
-
-    @invariant DataClassOnRentedCloud
-        -- Later, cheap cloud Slurm (spot or preemptible machines) is a
-        -- supplier like any other; it serves only the data classes its
-        -- configuration approves (synthetic and test by default, D-037).
-}
-
 ------------------------------------------------------------
 -- Entities and Variants
 ------------------------------------------------------------
@@ -197,65 +147,9 @@ entity WorkerBuild {
     registered_at: Timestamp
 }
 
--- A request to the grid scheduler for one host, or for a batch of hosts (a job
--- array, array_size > 1) for a regulatory run (D-037, D-045). Released when
--- every host it carries has left.
-entity HostAllocation {
-    reason: String
-    requested_at: Timestamp
-    state: submitted | granted | released | refused
-    scheduler_ref: String?
-    walltime_ends_at: Timestamp?
-    ended_at: Timestamp?
-    slow_alerted: Boolean
-    array_size: Integer
-    -- When the hosts must be serving (the run's cut-off); null for single hosts.
-    needed_by: Timestamp?
-    late_alerted: Boolean
-    hosts: ComputeHost with allocation = this
-    live_hosts: hosts where presence != gone
-    serving_now: hosts where presence = serving
-
-    transitions state {
-        submitted -> granted
-        submitted -> refused
-        granted -> released
-        terminal: released, refused
-    }
-}
-
--- A BEAM node in the Veridian cluster that hosts Julia worker processes
--- (D-030). Elasticity = hosts joining and retiring; each host grows or
--- shrinks its own worker pool up to max_workers. A host from the grid
--- carries its allocation and must have left before the walltime ends.
-entity ComputeHost {
-    node_name: String
-    max_workers: Integer
-    joined_at: Timestamp
-    -- The control plane's own liveness signal (D-045).
-    last_heartbeat: Timestamp
-    allocation: HostAllocation?
-    walltime_ends_at: Timestamp?
-    presence: joining | serving | retiring | gone
-    left_at: Timestamp when presence = gone
-
-    transitions presence {
-        joining -> serving
-        serving -> retiring
-        serving -> gone
-        retiring -> gone
-        joining -> gone
-        terminal: gone
-    }
-
-    workers: WorkerProcess with host = this
-    live_workers: workers where lifecycle in {starting, idle, busy, draining}
-    is_empty: live_workers.count = 0
-}
-
 entity WorkerProcess {
     worker_ref: String
-    host: ComputeHost
+    host: hosts/ComputeHost
     build: WorkerBuild
     identity: data/User
     started_at: Timestamp
@@ -284,9 +178,12 @@ entity WorkerProcess {
     reported_pending: JobTicket with worker = this and phase = reported
 }
 
--- A dispatched node waiting for, or held by, a worker.
+-- A dispatched node, or a purged payload to recompute, waiting for or held by
+-- a worker. A recomputation runs the node again to rebuild its payload (02c).
 entity JobTicket {
     node: graph/CalculationNode
+    purpose: computation | recomputation
+    payload: ret/ResultPayload? when purpose = recomputation
     priority: Integer
     enqueued_at: Timestamp
     phase: queued | assigned | reported | finished
@@ -349,218 +246,9 @@ rule RegisterWorkerBuild {
     )
 }
 
-rule HostJoins {
-    when: HostJoined(supervisor, node_name, max_workers)
-    requires: data/permitted(supervisor, "cluster.join", node_name)
-    requires: not exists ComputeHost{node_name: node_name, presence: serving}
-    ensures: ComputeHost.created(
-        node_name: node_name,
-        max_workers: max_workers,
-        joined_at: now,
-        last_heartbeat: now,
-        presence: joining
-    )
-}
-
--- A host started inside a granted grid allocation.
-rule AllocatedHostJoins {
-    when: AllocatedHostJoined(supervisor, node_name, max_workers, allocation)
-    requires: data/permitted(supervisor, "cluster.join", node_name)
-    requires: allocation.state = granted
-    requires: not exists ComputeHost{node_name: node_name, presence: serving}
-    requires: allocation.hosts.count < allocation.array_size
-    ensures: ComputeHost.created(
-        node_name: node_name,
-        max_workers: max_workers,
-        joined_at: now,
-        last_heartbeat: now,
-        allocation: allocation,
-        walltime_ends_at: allocation.walltime_ends_at,
-        presence: joining
-    )
-}
-
-rule HostStartsServing {
-    when: HostReady(supervisor, host)
-    requires: host.presence = joining
-    ensures: host.presence = serving
-}
-
--- Scale down: the host takes no new jobs, finishes running ones, then leaves.
-rule HostRetires {
-    when: HostRetirementRequested(supervisor, host)
-    requires: host.presence = serving
-    ensures:
-        host.presence = retiring
-        for w in host.live_workers:
-            WorkerDrainRequested(worker: w)
-}
-
--- Walltime: a grid host stops taking jobs early enough to finish running
--- ones before the scheduler ends the allocation. Slurm preemption with a
--- grace period arrives as HostRetirementRequested; a hard kill as HostDown.
-rule WalltimeApproaching {
-    when: host: ComputeHost.walltime_ends_at - config.walltime_drain_margin <= now
-    requires: host.presence = serving
-    ensures:
-        host.presence = retiring
-        for w in host.live_workers:
-            WorkerDrainRequested(worker: w)
-}
-
-rule RetiredHostLeaves {
-    when: host: ComputeHost.is_empty
-    requires: host.presence = retiring
-    ensures:
-        host.presence = gone
-        host.left_at = now
-}
-
--- The host's supervisor reports it alive every config.heartbeat_interval.
-rule HostHeartbeatReceived {
-    when: HostHeartbeat(supervisor, host)
-    requires: host.presence in {joining, serving, retiring}
-    ensures: host.last_heartbeat = now
-}
-
--- The control plane declares a silent host lost itself (D-045): the grid's
--- own view is slower and is only a hint.
-rule HostSilent {
-    -- model: bundled_dispatch.declareLost
-    when: host: ComputeHost.last_heartbeat + config.heartbeat_timeout <= now
-    requires: host.presence in {joining, serving, retiring}
-    ensures: HostLostDeclared(host: host, reason: "heartbeat lost")
-}
-
--- The grid reports the host's job ended (killed, preempted, node down).
-rule HostDownReported {
-    when: HostDown(supervisor, host)
-    requires: host.presence in {joining, serving, retiring}
-    ensures: HostLostDeclared(host: host, reason: "host down reported")
-}
-
--- Host crash or network partition: every job on it is treated as crashed
--- (the graph retries elsewhere, node by node); nothing outside that host is
--- affected.
-rule HostLost {
-    -- model: bundled_dispatch.declareLost
-    when: HostLostDeclared(host, reason)
-    requires: host.presence in {joining, serving, retiring}
-    ensures:
-        host.presence = gone
-        host.left_at = now
-        for w in host.live_workers:
-            WorkerGone(worker: w, reason: reason)
-}
-
--- The allocation ends with its last host (a batch of hosts together).
-rule ReleaseAllocation {
-    when: host: ComputeHost.presence becomes gone
-    requires: exists host.allocation
-    let allocation = host.allocation
-    requires: allocation.state = granted
-    requires: allocation.live_hosts.count = 0
-    ensures:
-        allocation.state = released
-        allocation.ended_at = now
-}
-
--- Elasticity signal: sustained queue pressure asks for a host, sustained idle
--- capacity releases one. At most one request is outstanding at a time.
-rule ScaleOut {
-    when: QueuePressureObserved(supervisor, queued, capacity)
-    requires: queued > capacity * config.scale_out_factor
-    requires: serving_hosts() < config.max_hosts
-    requires: not exists HostAllocation{state: submitted, array_size: 1}
-    ensures: HostRequested(reason: "queue pressure")
-}
-
-rule SubmitAllocation {
-    when: HostRequested(reason)
-    ensures: HostAllocation.created(
-        reason: reason,
-        requested_at: now,
-        state: submitted,
-        slow_alerted: false,
-        array_size: 1,
-        needed_by: null,
-        late_alerted: false
-    )
-}
-
--- A regulatory run's peak: one batch request for all its hosts, made ahead of
--- the cut-off by the schedule (06, RequestRunCapacity) under the higher
--- quality of service (D-039, D-045).
-rule SubmitEodArray {
-    when: batch/RunCapacityNeeded(schedule, workers, needed_by)
-    ensures: HostAllocation.created(
-        reason: "regulatory run: " + schedule.name,
-        requested_at: now,
-        state: submitted,
-        slow_alerted: false,
-        array_size: hosts_for_workers(workers),
-        needed_by: needed_by,
-        late_alerted: false
-    )
-}
-
--- Capacity that is not all serving by the cut-off is reported at once,
--- complete or partial: the run starts regardless, with what it has.
-rule EodArrayLate {
-    when: allocation: HostAllocation.needed_by <= now
-    requires: allocation.state in {submitted, granted}
-    requires: allocation.serving_now.count < allocation.array_size
-    requires: not allocation.late_alerted
-    ensures:
-        allocation.late_alerted = true
-        HostSupplyLate(allocation: allocation, serving: allocation.serving_now.count)
-}
-
-rule AllocationGranted {
-    when: AllocationStarted(supervisor, allocation, scheduler_ref, walltime_ends_at)
-    requires: allocation.state = submitted
-    ensures:
-        allocation.state = granted
-        allocation.scheduler_ref = scheduler_ref
-        allocation.walltime_ends_at = walltime_ends_at
-}
-
--- Refused or cancelled by the grid: operations are told; the queue keeps
--- its backpressure and the next pressure signal may ask again.
-rule AllocationRefused {
-    when: AllocationDenied(supervisor, allocation, reason)
-    requires: allocation.state = submitted
-    ensures:
-        allocation.state = refused
-        allocation.ended_at = now
-        HostSupplyFailed(allocation: allocation, reason: reason)
-}
-
-rule AllocationSlow {
-    when: allocation: HostAllocation.requested_at + config.allocation_wait_alert <= now
-    requires: allocation.state = submitted
-    requires: not allocation.slow_alerted
-    ensures:
-        allocation.slow_alerted = true
-        HostSupplySlow(allocation: allocation)
-}
-
-rule ScaleIn {
-    when: IdleCapacityObserved(supervisor, host)
-    requires: host.presence = serving
-    requires: serving_hosts() > config.min_hosts
-    ensures: HostRetirementRequested(supervisor: supervisor, host: host)
-}
-
-rule DrainIdleWorker {
-    when: WorkerDrainRequested(worker)
-    requires: worker.lifecycle = idle
-    ensures: worker.lifecycle = draining
-}
-
 -- The host's supervisor starts processes; a new one replaces any that stopped.
 rule WorkerStarts {
-    when: WorkerSpawned(supervisor, worker_ref, host, build, identity)
+    when: hosts/WorkerSpawned(supervisor, worker_ref, host, build, identity)
     requires: data/permitted(supervisor, "worker.spawn", build.build_hash)
     requires: host.presence = serving
     requires: host.live_workers.count < host.max_workers
@@ -576,7 +264,7 @@ rule WorkerStarts {
 }
 
 rule WorkerBecomesReady {
-    when: WorkerReady(reporter, worker)
+    when: disp/WorkerReady(reporter, worker)
     requires: worker.identity = reporter
     requires: worker.lifecycle = starting
     ensures: worker.lifecycle = idle
@@ -591,164 +279,9 @@ rule WorkerFailsToStart {
         worker.stop_reason = "start timeout"
 }
 
--- Bounded queue: when full, dispatch is held back and nodes stay pending in
--- the queue's place (backpressure), never dropped.
-rule EnqueueJob {
-    when: graph/ComputationDispatched(node)
-    requires: queued_count() < config.queue_capacity
-    ensures: JobTicket.created(
-        node: node,
-        priority: priority_of(node),
-        enqueued_at: now,
-        phase: queued
-    )
-}
-
--- Highest priority first, then oldest; only to a worker whose build can run
--- the nodes' models. An idle worker takes a bundle: up to config.bundle_size
--- tickets, fewer when the queue holds fewer (D-044).
-rule AssignJob {
-    -- model: bundled_dispatch.takeBundle
-    when: worker: WorkerProcess.lifecycle becomes idle
-    let tickets = next_tickets_for(worker.build, config.bundle_size)
-    requires: tickets.count > 0
-    ensures:
-        worker.lifecycle = busy
-        for ticket in tickets:
-            ticket.phase = assigned
-            ticket.worker = worker
-            graph/ComputationAssigned(node: ticket.node)
-}
-
-rule JobSucceeds {
-    -- model: bundled_dispatch.receive
-    when: WorkerReportsSuccess(reporter, ticket, result_ref, result_hash)
-    requires: ticket.phase = assigned
-    let worker = ticket.worker
-    requires: worker.identity = reporter
-    requires: worker.lifecycle = busy
-    ensures:
-        ticket.phase = reported
-        ticket.outcome = succeeded
-        ticket.result_ref = result_ref
-        ticket.result_hash = result_hash
-        worker.jobs_done = worker.jobs_done + 1
-}
-
--- A rejection is reported like a result and recorded with the bundle.
-rule JobRejected {
-    when: WorkerReportsRejection(reporter, ticket, reason)
-    requires: ticket.phase = assigned
-    let worker = ticket.worker
-    requires: worker.identity = reporter
-    requires: worker.lifecycle = busy
-    ensures:
-        ticket.phase = reported
-        ticket.outcome = rejected
-        ticket.rejection_reason = reason
-        worker.jobs_done = worker.jobs_done + 1
-}
-
--- Once every ticket of the bundle is reported, one ledger transaction records
--- them all; a node counts as complete (or rejected) in the graph only when
--- that transaction commits (D-044, D-056).
-rule BundleCommitted {
-    -- model: bundled_dispatch.commitBundle
-    when: ticket: JobTicket.phase becomes reported
-    let worker = ticket.worker
-    requires: worker.lifecycle = busy
-    requires: worker.held.count = 0
-    ensures:
-        for t in worker.reported_pending:
-            t.phase = finished
-            if t.outcome = succeeded:
-                graph/ComputationSucceeded(worker: worker.identity, node: t.node, result_ref: t.result_ref, result_hash: t.result_hash)
-            else:
-                graph/ComputationRejected(worker: worker.identity, node: t.node, reason: t.rejection_reason)
-}
-
--- The worker is free once nothing of its bundle is held or waiting.
-rule BundleFinished {
-    -- model: bundled_dispatch.commitBundle
-    when: ticket: JobTicket.phase becomes finished
-    let worker = ticket.worker
-    requires: worker.lifecycle = busy
-    requires: worker.held.count = 0
-    requires: worker.reported_pending.count = 0
-    ensures: WorkerFreed(worker: worker)
-}
-
--- A freed worker takes the next job, or is recycled after its quota.
-rule FreeWorker {
-    when: WorkerFreed(worker)
-    requires: worker.lifecycle = busy
-    ensures:
-        if worker.jobs_done >= config.max_jobs_per_worker or worker.host.presence = retiring:
-            worker.lifecycle = draining
-        else:
-            worker.lifecycle = idle
-}
-
-rule DrainedWorkerStops {
-    when: worker: WorkerProcess.lifecycle becomes draining
-    ensures:
-        worker.lifecycle = stopped
-        worker.stopped_at = now
-        worker.stop_reason = "recycled"
-}
-
--- Process exit, out-of-memory kill or kill after timeout: the tickets the
--- worker still held and those it reported but whose bundle did not commit are
--- crashed, each on its own; the graph decides per node whether to retry (02,
--- ComputationCrashes). Nodes recorded by an earlier committed bundle stay
--- complete (D-044, D-056).
-rule WorkerExitReported {
-    -- model: bundled_dispatch.procDies
-    when: WorkerExited(supervisor, worker, reason)
-    ensures: WorkerGone(worker: worker, reason: reason)
-}
-
-rule WorkerDies {
-    -- model: bundled_dispatch.declareLost
-    when: WorkerGone(worker, reason)
-    requires: worker.lifecycle = busy
-    requires: worker.held.count > 0 or worker.reported_pending.count > 0
-    ensures:
-        worker.lifecycle = stopped
-        worker.stopped_at = now
-        worker.stop_reason = reason
-        for ticket in worker.held:
-            ticket.phase = finished
-            graph/ComputationCrashed(worker: worker.identity, node: ticket.node, reason: reason)
-        for ticket in worker.reported_pending:
-            ticket.phase = finished
-            graph/ComputationCrashed(worker: worker.identity, node: ticket.node, reason: reason)
-}
-
-rule MemoryLimitExceeded {
-    when: WorkerOverMemory(supervisor, worker, rss_mb)
-    requires: worker.lifecycle = busy
-    requires: rss_mb > config.worker_memory_limit_mb
-    ensures: WorkerExited(supervisor: supervisor, worker: worker, reason: "memory limit")
-}
-
-------------------------------------------------------------
--- Invariants
-------------------------------------------------------------
-
-invariant BundleWithinLimit {
-    -- model: bundled_dispatch.bundleWithinLimit
-    for w in WorkerProcesses:
-        w.held.count <= config.bundle_size
-}
-
 ------------------------------------------------------------
 -- Actor Declarations
 ------------------------------------------------------------
-
-actor WorkerSupervisor {
-    identified_by: data/User
-}
 
 actor JuliaWorker {
     identified_by: data/User
@@ -761,56 +294,6 @@ actor BuildPublisher {
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
-
-surface Supervision {
-    facing supervisor: WorkerSupervisor
-    context worker: WorkerProcess
-
-    exposes:
-        worker.worker_ref
-        worker.lifecycle
-        worker.jobs_done
-
-    provides:
-        WorkerSpawned(supervisor, worker_ref, host, build, identity)
-        HostJoined(supervisor, node_name, max_workers)
-        AllocatedHostJoined(supervisor, node_name, max_workers, allocation)
-        AllocationStarted(supervisor, allocation, scheduler_ref, walltime_ends_at)
-        AllocationDenied(supervisor, allocation, reason)
-        HostReady(supervisor, host)
-        HostHeartbeat(supervisor, host)
-        HostRetirementRequested(supervisor, host)
-        HostDown(supervisor, host)
-        QueuePressureObserved(supervisor, queued, capacity)
-        IdleCapacityObserved(supervisor, host)
-        WorkerExited(supervisor, worker, reason)
-        WorkerOverMemory(supervisor, worker, rss_mb)
-
-    contracts:
-        demands HostSupply
-}
-
-surface JobChannel {
-    facing julia: JuliaWorker
-    context ticket: JobTicket where phase = assigned
-
-    exposes:
-        ticket.node.calc_id
-        ticket.node.model.code_hash
-        ticket.node.as_of
-        ticket.node.inputs
-
-    provides:
-        WorkerReady(julia, worker)
-        WorkerReportsSuccess(julia, ticket, result_ref, result_hash)
-        WorkerReportsRejection(julia, ticket, reason)
-
-    contracts:
-        demands WorkerIsolation
-        demands JobGranularity
-        demands graph/DeterministicComputation
-        demands TestDoubles
-}
 
 surface BuildPublication {
     facing publisher: BuildPublisher
@@ -826,6 +309,14 @@ surface BuildPublication {
 -- hosts_for_workers(workers): hosts needed for that many workers, from each
 -- host's max_workers. A host that has drained, been preempted or been lost
 -- before the cut-off is not replaced by this rule: the late alert covers it.
+-- environment_of(worker): the graph/RunEnvironment of a worker process (D-064):
+-- its build hash and Julia version, the build's release, the threads per job
+-- and the version of the fixed reduction order the host runs. Identical content
+-- gives the same entity, so environments compare by identity.
+-- log_tail(worker): the last lines of the worker's error output kept by its
+-- supervisor, or null when it has none.
+-- recomputation_priority(): the priority of a recomputation ticket (D-030: below
+-- interactive requests, above development).
 -- queued_count(), priority_of(node), next_tickets_for(build, limit): queue
 -- black boxes; next_tickets_for returns up to `limit` queued tickets in
 -- priority order that the build can run. A requeued ticket (assigned -> queued) happens only when a build is

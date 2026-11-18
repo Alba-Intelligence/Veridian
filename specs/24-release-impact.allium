@@ -1,0 +1,383 @@
+-- allium: 3
+-- 24-release-impact.allium
+
+-- Scope: The numerical effect of a production release, shown before it
+--   activates (D-067, gap review item 1).
+-- Includes: the impact run (the last signed-off run of each production
+--   schedule replayed under the candidate release), the comparison with what
+--   was published, review of differences, sign-off, and the staleness that
+--   makes a run void.
+-- Excludes:
+--   - Model validation (21): this spec is about figures, not model quality.
+--   - The release lifecycle itself (05), which asks this spec whether a
+--     release's impact is cleared.
+--   - The durability of the nodes an impact run makes: they are ephemeral (23).
+-- Dependencies: 01, 02, 05, 06, 23.
+--
+-- Why: the gates of 05 and 21 approve the content of a release, not its
+-- effect on reported figures. Memoization makes the answer cheap: only the
+-- nodes that read a changed model or parameter set recompute; everything else
+-- is a memo hit.
+--
+-- The rules (user choices, D-067):
+--   - Required for a production release that adds or changes a model version
+--     or a parameter set, and only then (as the model gate, D-058). It blocks
+--     activation until it is signed off.
+--   - Basis: the latest signed-off run of each active production schedule,
+--     with its as_of and cut-off frozen, re-run under the candidate release
+--     with the candidate's models, on the production data it used.
+--   - Every reported figure is compared with the published one. Tolerances
+--     per figure kind are configuration of the release that is active when the
+--     run starts, never of the candidate (a release cannot loosen its own test).
+--     A difference beyond tolerance is a finding that needs an explanation and
+--     acceptance by a reviewer other than the release's author.
+--   - A run is void ("stale") when another release activates before the
+--     candidate does: the base and the tolerances change. A newer published run
+--     does not void it: the last signed-off run is the basis, and yesterday's
+--     replay still meets that (D-067).
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./23-ephemeral-tier.allium" as tier
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity ImpactRun {
+    release: cfg/ConfigurationRelease
+    -- The release that was active when the run started: the figures' own
+    -- release, and the one whose tolerances apply.
+    base_release: cfg/ConfigurationRelease
+    started_at: Timestamp
+    status: running | completed | signed_off | rejected | stale
+    signed_off_by: data/User when status = signed_off
+    signed_off_at: Timestamp when status = signed_off
+    reason: String when status = rejected | stale
+
+    transitions status {
+        running -> completed
+        running -> rejected
+        running -> stale
+        completed -> signed_off
+        completed -> rejected
+        completed -> stale
+        signed_off -> stale
+        terminal: rejected, stale
+    }
+
+    basis: ImpactBasis with impact_run = this
+    findings: ImpactFinding with impact_run = this
+    open_findings: findings where disposition = open
+}
+
+-- One published run replayed under the candidate release.
+entity ImpactBasis {
+    impact_run: ImpactRun
+    run: batch/BatchRun
+    -- The replay request of the graph, with data class impact.
+    request: graph/CalculationRequest
+}
+
+-- One reported figure, published against replayed.
+entity ImpactFinding {
+    impact_run: ImpactRun
+    figure_ref: String
+    figure_kind: String
+    published_value: Decimal
+    candidate_value: Decimal
+    abs_difference: Decimal
+    rel_difference: Decimal
+    -- within: inside the tolerance, nothing to do. open: outside, to be
+    -- accepted. accepted: outside, explained and accepted.
+    disposition: within | open | accepted
+    explanation: String? when disposition = accepted
+    accepted_by: data/User? when disposition = accepted
+
+    transitions disposition {
+        open -> accepted
+        terminal: within, accepted
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- How many of the latest signed-off runs of each schedule are replayed
+    -- (D-067: one; more is a configuration change).
+    replay_runs: Integer = 1
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A production release that changes figures starts its run as soon as it is
+-- received; it waits in `received` for the outcome (05). The run and every
+-- basis with its replay request are created together, so the run never
+-- completes before all its bases exist. The request is made here and not
+-- through 02's intake, which refuses unreleased models and a class other than
+-- the subjects'; the replay uses the candidate's models on what the run saw.
+rule StartImpactRun {
+    -- model: release_impact.start
+    when: release: cfg/ConfigurationRelease.created
+    requires: release.kind = production
+    requires: impact_required(release)
+    ensures:
+        let impact = ImpactRun.created(
+            release: release,
+            base_release: cfg/active_release(production),
+            started_at: now,
+            status: running
+        )
+        for r in latest_published_runs(config.replay_runs):
+            ImpactBasis.created(
+                impact_run: impact,
+                run: r,
+                request: graph/CalculationRequest.created(
+                    requested_by: platform_service(),
+                    model: replay_model(r, release),
+                    subjects: replay_subjects(r),
+                    data_class: impact,
+                    as_of: r.as_of,
+                    known_at: r.cutoff,
+                    origin_ref: impact_ref(impact, r),
+                    requested_at: now,
+                    status: open,
+                    pinned_inputs: {},
+                    plan_expanded: false
+                )
+            )
+}
+
+-- Every replay is fulfilled: compare every figure with the published one,
+-- against the base release's tolerance for its kind.
+rule CompareFigures {
+    -- model: release_impact.complete
+    when: done: ImpactBasis.request.status transitions_to fulfilled
+    let impact = done.impact_run
+    requires: impact.status = running
+    requires: impact.basis.all(x => x.request.status = fulfilled)
+    ensures:
+        impact.status = completed
+        for b in impact.basis:
+            for f in published_figures(b.run):
+                ImpactFinding.created(
+                    impact_run: impact,
+                    figure_ref: figure_ref_of(f),
+                    figure_kind: figure_kind_of(f),
+                    published_value: published_value_of(f),
+                    candidate_value: candidate_value_of(b.request, f),
+                    abs_difference: abs_difference_of(b.request, f),
+                    rel_difference: rel_difference_of(b.request, f),
+                    disposition:
+                        if within_tolerance(impact.base_release, f, b.request): within
+                        else: open
+                )
+}
+
+-- A replay that does not compute means the candidate cannot run today's book:
+-- the run is rejected and the release needs a new submission.
+rule ReplayFails {
+    -- model: release_impact.reject
+    when: b: ImpactBasis.request.status transitions_to unfulfilled
+    requires: b.impact_run.status = running
+    ensures:
+        b.impact_run.status = rejected
+        b.impact_run.reason = "a replayed run did not compute under the candidate release"
+}
+
+-- A reviewer explains a difference beyond tolerance and accepts it. Never the
+-- author of the release.
+rule AcceptFinding {
+    -- model: release_impact.accept
+    when: FindingAccepted(reviewer, finding, explanation)
+    requires: finding.disposition = open
+    requires: finding.impact_run.status = completed
+    requires: data/permitted(reviewer, "release.impact.review", finding.impact_run.release.tag)
+    requires: reviewer != finding.impact_run.release.authored_by
+    ensures:
+        finding.disposition = accepted
+        finding.explanation = explanation
+        finding.accepted_by = reviewer
+}
+
+-- Sign-off needs every finding closed, and a reviewer other than the author.
+rule SignOffImpact {
+    -- model: release_impact.signOff
+    when: ImpactSignedOff(reviewer, impact)
+    requires: impact.status = completed
+    requires: impact.open_findings.count = 0
+    requires: data/permitted(reviewer, "release.impact.review", impact.release.tag)
+    requires: reviewer != impact.release.authored_by
+    ensures:
+        impact.status = signed_off
+        impact.signed_off_by = reviewer
+        impact.signed_off_at = now
+}
+
+rule RejectImpact {
+    -- model: release_impact.reject
+    when: ImpactRejected(reviewer, impact, reason)
+    requires: impact.status in {running, completed}
+    requires: data/permitted(reviewer, "release.impact.review", impact.release.tag)
+    ensures:
+        impact.status = rejected
+        impact.reason = reason
+}
+
+-- Another release activating changes the figures' base and the tolerances;
+-- while the release still waits, a new run starts.
+rule StaleOnBaseChange {
+    -- model: release_impact.activate
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for i in ImpactRuns where status in {running, completed, signed_off}:
+            if i.release != release and i.release.status = received:
+                i.status = stale
+                i.reason = "another release was activated"
+                ImpactRestartWanted(release: i.release)
+}
+
+rule RestartImpactRun {
+    -- model: release_impact.start
+    when: ImpactRestartWanted(release)
+    requires: release.status = received
+    requires: impact_required(release)
+    ensures:
+        let impact = ImpactRun.created(
+            release: release,
+            base_release: cfg/active_release(production),
+            started_at: now,
+            status: running
+        )
+        for r in latest_published_runs(config.replay_runs):
+            ImpactBasis.created(
+                impact_run: impact,
+                run: r,
+                request: graph/CalculationRequest.created(
+                    requested_by: platform_service(),
+                    model: replay_model(r, release),
+                    subjects: replay_subjects(r),
+                    data_class: impact,
+                    as_of: r.as_of,
+                    known_at: r.cutoff,
+                    origin_ref: impact_ref(impact, r),
+                    requested_at: now,
+                    status: open,
+                    pinned_inputs: {},
+                    plan_expanded: false
+                )
+            )
+}
+
+-- A node made for an impact run is adopted by a durable request on the same
+-- calc_id once the model is released: it becomes an ordinary node of that
+-- request's class (23, PromoteNode). Impact runs reuse every unchanged node
+-- of the real runs, and the real runs after activation reuse the impact run's.
+rule AdoptImpactNode {
+    when: tier/PromotionRequested(node, adopted_for)
+    requires: node.data_class = impact
+    requires: released_for_production(node.model)
+    ensures: node.data_class = adopted_for.data_class
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- 05 activates a release that needs an impact run only with a signed-off,
+-- current one (the activation rules of 05 ask `impact_cleared`).
+
+-- No one signs off an impact run of their own release.
+invariant SignerIsNotAuthor {
+    -- model: release_impact.signerIndependent
+    for i in ImpactRuns:
+        i.status = signed_off implies i.signed_off_by != i.release.authored_by
+}
+
+-- No signed-off run has an open finding.
+invariant SignedOffHasNoOpenFinding {
+    -- model: release_impact.noOpenAtSignOff
+    for i in ImpactRuns:
+        i.status = signed_off implies i.open_findings.count = 0
+}
+
+-- Impact nodes are ephemeral (23) until a durable request adopts them.
+invariant ImpactNodesAreEphemeral {
+    for n in graph/CalculationNodes where data_class = impact:
+        exists tier/EphemeralNode{node: n, state: ephemeral}
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ReleaseReviewer {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ImpactReview {
+    facing reviewer: ReleaseReviewer
+    context impact: ImpactRun
+
+    exposes:
+        impact.release.tag
+        impact.base_release.tag
+        impact.status
+        for f in impact.findings where disposition != within:
+            f.figure_ref
+            f.figure_kind
+            f.published_value
+            f.candidate_value
+            f.abs_difference
+            f.rel_difference
+            f.disposition
+            f.explanation
+
+    provides:
+        FindingAccepted(reviewer, finding, explanation) when finding.disposition = open
+        ImpactSignedOff(reviewer, impact) when impact.status = completed
+        ImpactRejected(reviewer, impact, reason) when impact.status in {running, completed}
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- impact_cleared(release): for the activation rules of 05. True when the
+-- release needs no impact run (not impact_required(release)), or an
+-- ImpactRun of it has status signed_off.
+-- Black boxes owned by Elixir:
+--   impact_required(release): true when the release, compared with the active
+--     production release, adds or changes a model version (graph model
+--     version, D-060) or a parameter set a calculation reads, and there is a
+--     published run to replay; false otherwise.
+--   latest_published_runs(n): for each active production schedule, its n most
+--     recent runs whose publication is in effect.
+--   replay_model(run, release), replay_subjects(run): the candidate's
+--     counterpart of the run's model, and the subjects its request had.
+--   impact_ref(impact, run), platform_service(): reference string for the
+--     request's origin (an impact run), and the service identity.
+--   published_figures(run), figure_ref_of / figure_kind_of /
+--     published_value_of(f), candidate_value_of / abs_difference_of /
+--     rel_difference_of(request, f), within_tolerance(base, f, request):
+--     the figures of a run and their comparison; tolerances (absolute and
+--     relative, per figure kind) are read from the base release.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Emergency releases (20, D-048) reach production under a third reviewer. Is their impact run waived with a flag and reviewed afterwards, or required like any other?"
+open question "A figure the candidate no longer produces, or a new one it adds, has no published counterpart or no candidate value. Is it always a finding, with its own disposition?"
+open question "The replay uses the production data of the published run. Should it also replay one or more stress dates (D-067 chose one run by default; the count is configuration)?"
+-- Resolved (D-068, D-069): the replay covers the figures of the published batch run only. Stress runs (25b) and P&L (26) start after publication from their own requests and are not replayed by the gate.

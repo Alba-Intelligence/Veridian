@@ -1,0 +1,177 @@
+-- allium: 3
+-- 19b-export-and-submission.allium
+
+-- Scope: Exporting a report, recording its submission to the regulator and
+--   the regulator's acceptance or refusal, and submission deadlines. Part of 19.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./11-frtb-sa.allium" as frtb
+use "./12-web-front-end-and-batch-console.allium" as web
+use "./13-report-review-alerts-trends.allium" as review
+use "./13b-alerts.allium" as alerts
+use "./19-regulatory-reports.allium" as regrep
+use "./19c-report-validation.allium" as val
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A person's export of a released report: who took the file and when.
+entity ReportExport {
+    report: regrep/RegulatoryReport
+    exported_by: data/User
+    exported_at: Timestamp
+    file_hash: String
+}
+
+-- The submission made by a person through the regulator's channel.
+entity Submission {
+    report: regrep/RegulatoryReport
+    submitted_by: data/User
+    submitted_at: Timestamp
+    receipt_ref: String
+    outcome: pending | accepted | refused
+    outcome_at: Timestamp?
+    outcome_reason: String?
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule ExportReport {
+    when: ReportExportRequested(user, report)
+    requires: report.state in {released, submitted, accepted, refused}
+    requires: data/permitted(user, "report.export", report.template.template_code)
+    requires: data/freshly_authenticated(user)
+    ensures: ReportExport.created(
+        report: report,
+        exported_by: user,
+        exported_at: now,
+        file_hash: report.file_hash
+    )
+}
+
+-- The submission is recorded by the person who made it, against a report they
+-- exported. The receipt reference is the regulator's own.
+rule RecordSubmission {
+    when: SubmissionRecorded(user, report, receipt_ref)
+    requires: report.state = released
+    requires: exists ReportExport{report: report, exported_by: user}
+    requires: data/permitted(user, "report.submit", report.template.template_code)
+    requires: data/freshly_authenticated(user)
+    ensures:
+        report.state = submitted
+        Submission.created(
+            report: report,
+            submitted_by: user,
+            submitted_at: now,
+            receipt_ref: receipt_ref,
+            outcome: pending
+        )
+}
+
+rule RecordAcceptance {
+    when: RegulatorAccepted(user, submission)
+    requires: submission.outcome = pending
+    requires: data/permitted(user, "report.submit", submission.report.template.template_code)
+    ensures:
+        submission.outcome = accepted
+        submission.outcome_at = now
+        submission.report.state = accepted
+}
+
+-- A refusal is an alert and needs a corrected version: the regulator's reason
+-- is kept, and the owner decides on a restatement (06).
+rule RecordRefusal {
+    when: RegulatorRefused(user, submission, reason)
+    requires: submission.outcome = pending
+    requires: data/permitted(user, "report.submit", submission.report.template.template_code)
+    ensures:
+        submission.outcome = refused
+        submission.outcome_at = now
+        submission.outcome_reason = reason
+        submission.report.state = refused
+        alerts/Alert.created(
+            source: run_problem,
+            subject_ref: submission.report.template.template_code,
+            description: "regulator refused the submission",
+            raised_at: now,
+            owner: submission.report.publication.run.schedule.owner,
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule DeadlineApproaching {
+    when: report: regrep/RegulatoryReport.due_at - regrep/config.deadline_warning <= now
+    requires: report.state in {generated, failed_validation, validated, released}
+    ensures: alerts/Alert.created(
+        source: run_problem,
+        subject_ref: report.template.template_code,
+        description: "regulatory report not yet submitted near its deadline",
+        raised_at: now,
+        owner: report.publication.run.schedule.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule DeadlineMissed {
+    when: report: regrep/RegulatoryReport.due_at <= now
+    requires: report.state in {generated, failed_validation, validated, released}
+    ensures: alerts/Alert.created(
+        source: run_problem,
+        subject_ref: report.template.template_code,
+        description: "regulatory report deadline missed",
+        raised_at: now,
+        owner: report.publication.run.schedule.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant SubmissionNeedsExport {
+    for s in Submissions:
+        exists ReportExport{report: s.report, exported_by: s.submitted_by}
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface RegulatoryReportHandling {
+    facing officer: regrep/ReportingOfficer
+    context report: regrep/RegulatoryReport
+
+    exposes:
+        report.template.regulator
+        report.template.template_code
+        report.template.taxonomy_version
+        report.perimeter.name
+        report.publication.run.as_of
+        report.version
+        report.supersedes
+        report.state
+        report.due_at
+        report.file_hash
+        findings_of(report)
+        differences_of(report)
+        submission_of(report)
+
+    provides:
+        ReportExportRequested(officer, report) when report.state in {released, submitted, accepted, refused}
+        SubmissionRecorded(officer, report, receipt_ref) when report.state = released
+        RegulatorAccepted(officer, submission) when submission_of(report).outcome = pending
+        RegulatorRefused(officer, submission, reason) when submission_of(report).outcome = pending
+
+    contracts:
+        demands web/WebFrontEnd
+}

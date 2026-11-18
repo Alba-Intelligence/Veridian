@@ -1,0 +1,80 @@
+-- allium: 3
+-- 19c-report-validation.allium
+
+-- Scope: Validation of a generated report: findings, and the cell differences
+--   against the previous version of a restated report. Part of 19.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./11-frtb-sa.allium" as frtb
+use "./12-web-front-end-and-batch-console.allium" as web
+use "./13-report-review-alerts-trends.allium" as review
+use "./13b-alerts.allium" as alerts
+use "./19-regulatory-reports.allium" as regrep
+use "./19b-export-and-submission.allium" as sub
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A validation rule that failed, with the cells it involves.
+entity ValidationFinding {
+    report: regrep/RegulatoryReport
+    rule_ref: String
+    blocking: Boolean
+    cells: String
+    description: String
+}
+
+-- One cell that differs between a report and the one it supersedes.
+entity CellDifference {
+    report: regrep/RegulatoryReport
+    cell_ref: String
+    previous_value: Decimal?
+    new_value: Decimal?
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule ListDifferences {
+    when: report: regrep/RegulatoryReport.created
+    requires: report.supersedes != null
+    ensures:
+        for d in cell_differences(report, report.supersedes):
+            CellDifference.created(
+                report: report,
+                cell_ref: difference_cell(d),
+                previous_value: difference_previous(d),
+                new_value: difference_new(d)
+            )
+}
+
+rule ValidateReport {
+    when: report: regrep/RegulatoryReport.created
+    ensures:
+        for f in validation_findings(report):
+            ValidationFinding.created(
+                report: report,
+                rule_ref: finding_rule(f),
+                blocking: finding_blocking(f),
+                cells: finding_cells(f),
+                description: finding_description(f)
+            )
+        if has_blocking_findings(report):
+            report.state = failed_validation
+            alerts/Alert.created(
+                source: run_problem,
+                subject_ref: report.template.template_code,
+                description: "regulatory report failed the regulator's validation rules",
+                raised_at: now,
+                owner: report.publication.run.schedule.owner,
+                escalated: false,
+                alert_state: raised
+            )
+        else:
+            report.state = validated
+}

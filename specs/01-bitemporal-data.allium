@@ -21,22 +21,41 @@
 -- Data may be recorded now and become effective later, or be corrected later
 -- for a period in the past. Nothing is ever mutated in place.
 
+-- Split (D-070): this file holds series, versions, succession and the data
+--   steward surface; 01b-corrections the proposal and approval of corrections,
+--   single and in batches, and the handling of stale ones.
+
+use "./01b-corrections.allium" as corr
+
 ------------------------------------------------------------
--- External Entities
+-- Contracts
+------------------------------------------------------------
+
+contract InputRetention {
+    @invariant NeverPurgedWhileDepended
+        -- An input version is never purged while any retained result or any
+        -- reported figure depends on it (D-051). Reported figures are kept
+        -- for their own retention class (13, 10 years) and drill-down
+        -- recomputes purged payloads from inputs (02), so input retention
+        -- follows the longest dependent figure. Retention is configuration
+        -- (D-005); a setting that would purge a depended-on version is
+        -- refused when the release is verified.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
 ------------------------------------------------------------
 
 -- Identified user with specific access rights. Defined in 03-identity-access.
 external entity User {}
 
-------------------------------------------------------------
--- Enumerations
-------------------------------------------------------------
-
 -- Calculations never mix data classes (see 02-calculation-graph), with one
 -- one-way exception: whatif (D-038) holds a trader's hypothetical trades and
 -- market shifts, private to their author; a whatif calculation may read
 -- production inputs, but nothing outside whatif ever reads a whatif input.
-enum DataClass { production | golden | synthetic | test | whatif }
+-- impact (24, D-067): the replay of a published run under a candidate release;
+-- reads production inputs only, like whatif, and is never read by anything else.
+enum DataClass { production | golden | synthetic | test | whatif | impact }
 
 -- How a version came to exist:
 --   original    first statement for its period (RecordInputVersion)
@@ -45,10 +64,6 @@ enum DataClass { production | golden | synthetic | test | whatif }
 --               default, corporate action, amendment (D-023)
 --   remainder   the uncovered part of a replaced version (D-006)
 enum VersionOrigin { original | correction | succession | remainder }
-
-------------------------------------------------------------
--- Entities and Variants
-------------------------------------------------------------
 
 -- A logical input whose value changes over time, e.g. "trade IRS-000042",
 -- "EUR ESTR OIS par quotes", "issuer ACME ratings", "calendar TARGET".
@@ -112,40 +127,6 @@ entity InputVersion {
     }
 }
 
--- Many corrections reviewed and approved in one action (D-051): fixing a week
--- of curves at once. Each member stays an ordinary correction with one target,
--- one lineage and its own approval record; the batch only groups the review.
--- It is approved or rejected as a whole.
-entity CorrectionBatch {
-    submitted_by: User
-    submitted_at: Timestamp
-    corrections: Set<InputVersion>
-    approved_by: User? when status = approved
-    rejection_reason: String when status = declined
-    status: awaiting_review | approved | declined
-
-    transitions status {
-        awaiting_review -> approved
-        awaiting_review -> declined
-        terminal: approved, declined
-    }
-}
-
-------------------------------------------------------------
--- Contracts
-------------------------------------------------------------
-
-contract InputRetention {
-    @invariant NeverPurgedWhileDepended
-        -- An input version is never purged while any retained result or any
-        -- reported figure depends on it (D-051). Reported figures are kept
-        -- for their own retention class (13, 10 years) and drill-down
-        -- recomputes purged payloads from inputs (02), so input retention
-        -- follows the longest dependent figure. Retention is configuration
-        -- (D-005); a setting that would purge a depended-on version is
-        -- refused when the release is verified.
-}
-
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
@@ -183,45 +164,6 @@ rule RecordInputVersion {
         recorded_at: now,
         approved_by: null
     )
-}
-
--- A correction replaces all or part of an active version; it waits for a
--- second person. Golden data is corrected exactly like production (D-007).
--- Its effective range must lie within the target's range (D-006).
-rule ProposeCorrection {
-    when: CorrectionProposed(submitter, target, content_hash, effective_from, effective_to?)
-    requires: target.status = active
-    requires: permitted(submitter, "input.correct", target.series)
-    requires: effective_from >= target.effective_from
-    requires: target.effective_to = null
-        or (effective_to != null and effective_to <= target.effective_to)
-    ensures: InputVersion.created(
-        series: target.series,
-        content_hash: content_hash,
-        effective_from: effective_from,
-        effective_to: effective_to,
-        submitted_by: submitter,
-        submitted_at: now,
-        supersedes: target,
-        origin: correction,
-        carried_from: null,
-        status: proposed
-    )
-}
-
-rule ApproveCorrection {
-    when: CorrectionApproved(approver, correction)
-    requires: correction.status = proposed
-    requires: correction.supersedes != null
-    requires: correction.supersedes.status = active
-    requires: approver != correction.submitted_by
-    requires: permitted(approver, "input.approve_correction", correction.series)
-    requires: freshly_authenticated(approver)
-    ensures:
-        correction.status = active
-        correction.recorded_at = now
-        correction.approved_by = approver
-        VersionReplaced(replacement: correction, previous: correction.supersedes)
 }
 
 -- Activation and supersession share one knowledge instant, so no point in
@@ -346,106 +288,6 @@ rule AnnounceInputChange {
     ensures: InputChanged(series: version.series, version: version)
 }
 
-rule RejectCorrection {
-    when: CorrectionRejected(reviewer, correction, reason)
-    requires: correction.status = proposed
-    requires: reviewer != correction.submitted_by
-    requires: permitted(reviewer, "input.approve_correction", correction.series)
-    requires: freshly_authenticated(reviewer)
-    ensures:
-        correction.status = rejected
-        correction.rejected_by = reviewer
-        correction.rejection_reason = reason
-}
-
--- A correction waiting for approval whose target has since been superseded
--- (by another correction, a succession or a source correction) can never be
--- approved. It is closed at once with the reason and its author is told, who
--- proposes again against the current version if the fix is still needed; it
--- is never re-targeted, so an approver only ever approves what they saw
--- (D-051).
-rule FindStaleCorrections {
-    when: VersionReplaced(replacement, previous)
-    ensures:
-        for c in pending_corrections_of(previous):
-            StaleCorrectionFound(correction: c)
-}
-
-rule RejectStaleCorrection {
-    when: StaleCorrectionFound(correction)
-    requires: correction.status = proposed
-    ensures:
-        correction.status = rejected
-        correction.rejection_reason = "target superseded while the correction was pending"
-        StaleCorrectionRejected(correction: correction, author: correction.submitted_by)
-}
-
--- Batches (D-051). Members were proposed one by one, each against its own
--- target; the batch is one review and one approval action, and every member
--- is approved or rejected through the ordinary rules, so lineage is per
--- version.
-rule ProposeCorrectionBatch {
-    when: CorrectionBatchProposed(submitter, corrections)
-    requires: corrections.count >= 2
-    requires: corrections.all(c => c.status = proposed and c.submitted_by = submitter)
-    ensures: CorrectionBatch.created(
-        submitted_by: submitter,
-        submitted_at: now,
-        corrections: corrections,
-        status: awaiting_review
-    )
-}
-
-rule ApproveCorrectionBatch {
-    when: CorrectionBatchApproved(approver, batch)
-    requires: batch.status = awaiting_review
-    requires: approver != batch.submitted_by
-    requires: batch.corrections.all(c => c.status = proposed
-        and c.supersedes.status = active
-        and permitted(approver, "input.approve_correction", c.series))
-    requires: freshly_authenticated(approver)
-    ensures:
-        batch.status = approved
-        batch.approved_by = approver
-        for c in batch.corrections:
-            CorrectionApproved(approver: approver, correction: c)
-}
-
-rule RejectCorrectionBatch {
-    when: CorrectionBatchRejected(reviewer, batch, reason)
-    requires: batch.status = awaiting_review
-    requires: reviewer != batch.submitted_by
-    requires: batch.corrections.all(c => permitted(reviewer, "input.approve_correction", c.series))
-    requires: freshly_authenticated(reviewer)
-    ensures:
-        batch.status = declined
-        batch.rejection_reason = reason
-        for c in batch.corrections:
-            CorrectionRejected(reviewer: reviewer, correction: c, reason: reason)
-}
-
--- A batch is all or nothing: when one member goes stale the rest of the batch
--- is closed with it, and the author proposes again.
-rule RejectBatchOfStaleMember {
-    when: StaleCorrectionRejected(correction, author)
-    let batch = batch_containing(correction)
-    requires: batch != null
-    requires: batch.status = awaiting_review
-    ensures:
-        batch.status = declined
-        batch.rejection_reason = "a member correction became stale"
-        for c in batch.corrections:
-            CorrectionDroppedWithBatch(correction: c)
-}
-
-rule DropBatchMember {
-    when: CorrectionDroppedWithBatch(correction)
-    requires: correction.status = proposed
-    ensures:
-        correction.status = rejected
-        correction.rejection_reason = "its batch was rejected"
-}
-
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
@@ -494,8 +336,8 @@ surface InputDataManagement {
         InputSeriesRegistered(steward, key, schema_ref, data_class)
         InputVersionSubmitted(steward, series, content_hash, effective_from, effective_to?, lineage_ref?)
         CorrectionProposed(steward, target, content_hash, effective_from, effective_to?)
-        CorrectionApproved(steward, correction)
-        CorrectionRejected(steward, correction, reason)
+        corr/CorrectionApproved(steward, correction)
+        corr/CorrectionRejected(steward, correction, reason)
         CorrectionBatchProposed(steward, corrections)
         CorrectionBatchApproved(steward, batch) when batch.status = awaiting_review
         CorrectionBatchRejected(steward, batch, reason) when batch.status = awaiting_review

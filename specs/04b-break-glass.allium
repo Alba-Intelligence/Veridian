@@ -1,0 +1,129 @@
+-- allium: 3
+-- 04b-break-glass.allium
+
+-- Scope: Break-glass emergency access: invocation, expiry, review by another
+--   person and escalation when the review is overdue. Part of 04.
+
+use "./04-identity-access-audit.allium" as iam
+use "./04c-audit-trail.allium" as aud
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Break-glass (D-026): time-limited emergency use of a role, with a stated
+-- reason, reviewed afterwards by someone else.
+entity EmergencyAccess {
+    user: iam/User
+    role_name: String
+    reason: String
+    started_at: Timestamp
+    expires_at: Timestamp
+    -- Who may review it now (D-051): a peer holding the role's review
+    -- permission first; if nobody reviews within the deadline, the head of the
+    -- function; then the configured on-call rota, which is told again each
+    -- step until someone reviews. The person who used break-glass is never a
+    -- reviewer, at any level.
+    review_level: peer | head_of_function | on_call
+    next_escalation_at: Timestamp
+    status: open | closed | reviewed
+    closed_at: Timestamp when status = closed | reviewed
+    reviewed_by: iam/User when status = reviewed
+    review_findings: String when status = reviewed
+
+    transitions status {
+        open -> closed
+        closed -> reviewed
+        terminal: reviewed
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule InvokeBreakGlass {
+    when: BreakGlassInvoked(user, role_name, reason)
+    requires: user.status = active
+    requires: permitted(user, "breakglass.invoke", role_name)
+    requires: freshly_authenticated(user, iam/config.step_up_window)
+    ensures: EmergencyAccess.created(
+        user: user,
+        role_name: role_name,
+        reason: reason,
+        started_at: now,
+        expires_at: now + iam/config.break_glass_duration,
+        review_level: peer,
+        next_escalation_at: now + iam/config.break_glass_review_deadline,
+        status: open
+    )
+}
+
+rule CloseBreakGlass {
+    when: BreakGlassClosed(user, access)
+    requires: access.status = open
+    requires: access.user = user
+    ensures:
+        access.status = closed
+        access.closed_at = now
+}
+
+rule BreakGlassExpires {
+    when: access: EmergencyAccess.expires_at <= now
+    requires: access.status = open
+    ensures:
+        access.status = closed
+        access.closed_at = now
+}
+
+rule ReviewBreakGlass {
+    when: BreakGlassReviewed(reviewer, access, findings)
+    requires: access.status = closed
+    requires: reviewer != access.user
+    -- The permission of the current level (peer: breakglass.review,
+    -- head_of_function: breakglass.review_head, on_call:
+    -- breakglass.review_oncall); a holder of a higher level's permission may
+    -- also review at a lower one.
+    requires: reviewer_may_review(reviewer, access.review_level, access.role_name)
+    ensures:
+        access.status = reviewed
+        access.reviewed_by = reviewer
+        access.review_findings = findings
+}
+
+-- Each unanswered step moves the review one level up and tells that level;
+-- at the on-call rota it is repeated every step until someone reviews.
+rule BreakGlassReviewOverdue {
+    when: access: EmergencyAccess.next_escalation_at <= now
+    requires: access.status in {open, closed}
+    ensures:
+        access.review_level = next_review_level(access.review_level)
+        access.next_escalation_at = now + iam/config.break_glass_escalation_step
+        BreakGlassReviewEscalated(access: access, level: next_review_level(access.review_level))
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface EmergencyAccessControl {
+    facing operator: iam/Operator
+    context access: EmergencyAccess
+
+    exposes:
+        access.user.display_name
+        access.role_name
+        access.reason
+        access.status
+        access.started_at
+        access.expires_at
+        access.review_level
+
+    provides:
+        BreakGlassInvoked(operator, role_name, reason)
+        BreakGlassClosed(operator, access) when access.status = open
+        BreakGlassReviewed(operator, access, findings) when access.status = closed
+
+    timeout:
+        BreakGlassExpires
+}

@@ -32,21 +32,16 @@
 --     restrictions, and any adjustment belongs to the bank's own downstream
 --     process outside Veridian.
 
+-- Split (D-070): this file holds the inventory and the actors;
+--   21b-model-validation validations and their lifecycle;
+--   21c-benchmarks-and-breaches benchmark runs and breaches.
+
 use "./01-bitemporal-data.allium" as data
 use "./02-calculation-graph.allium" as graph
 use "./05-configuration-release.allium" as cfg
 use "./13-report-review-alerts-trends.allium" as review
-
-------------------------------------------------------------
--- Enumerations
-------------------------------------------------------------
-
--- high: models that drive regulatory capital or whose failure is hard to
--- see (lattice, calibration, FRTB aggregation). medium and low: simpler
--- models. The tier sets how often a model is validated and benchmarked.
-enum ModelTier { high | medium | low }
-
-enum ValidationOutcome { approved | approved_with_conditions | rejected }
+use "./21b-model-validation.allium" as val
+use "./21c-benchmarks-and-breaches.allium" as brc
 
 ------------------------------------------------------------
 -- Contracts
@@ -85,6 +80,13 @@ contract ModelGovernance {
 -- Entities and Variants
 ------------------------------------------------------------
 
+-- high: models that drive regulatory capital or whose failure is hard to
+-- see (lattice, calibration, FRTB aggregation). medium and low: simpler
+-- models. The tier sets how often a model is validated and benchmarked.
+enum ModelTier { high | medium | low }
+
+enum ValidationOutcome { approved | approved_with_conditions | rejected }
+
 -- A model in the inventory: defined in a configuration release.
 entity ModelInventoryEntry {
     function_name: String
@@ -99,60 +101,6 @@ entity ModelInventoryEntry {
     transitions status {
         in_inventory -> retired
         terminal: retired
-    }
-}
-
--- An independent validation of one model version.
-entity ModelValidation {
-    entry: ModelInventoryEntry
-    model_version: graph/ModelVersion
-    validator: data/User
-    outcome: ValidationOutcome
-    -- What the model is approved for, as a content hash of the scope
-    -- document (instrument kinds, ranges, data classes).
-    scope_hash: String
-    conditions: String?
-    conditions_due_at: Timestamp?
-    -- The largest difference to the independent reference that still counts
-    -- as agreement, set by the validator.
-    benchmark_tolerance: Decimal
-    evidence_ref: String
-    validated_at: Timestamp
-    valid_until: Timestamp
-    state: current | expired | superseded | withdrawn
-
-    transitions state {
-        current -> expired
-        current -> superseded
-        current -> withdrawn
-        terminal: expired, superseded, withdrawn
-    }
-}
-
--- One scheduled comparison with the independent reference.
-entity BenchmarkRun {
-    entry: ModelInventoryEntry
-    validation: ModelValidation
-    cases: Integer
-    max_difference: Decimal
-    tolerance: Decimal
-    within_tolerance: Boolean
-    run_at: Timestamp
-}
-
--- A benchmark outside tolerance. While open, no production release carrying
--- the model can be activated.
-entity ModelBreach {
-    entry: ModelInventoryEntry
-    benchmark: BenchmarkRun
-    raised_at: Timestamp
-    reviewed_by: data/User?
-    review_note: String?
-    state: open | reviewed
-
-    transitions state {
-        open -> reviewed
-        terminal: reviewed
     }
 }
 
@@ -205,190 +153,6 @@ rule RetireInventoryEntry {
     ensures: entry.status = retired
 }
 
--- Validation is recorded by a person from the validation function who is
--- neither the owner nor the author of the release that carried the version.
-rule RecordValidation {
-    -- model: release_gate.recordValidation
-    when: ValidationRecorded(validator, entry, model_version, outcome, scope_hash, conditions?, conditions_due_at?, benchmark_tolerance, evidence_ref)
-    requires: entry.status = in_inventory
-    requires: model_version.function_name = entry.function_name
-    requires: data/permitted(validator, "model.validate", entry.function_name)
-    requires: data/freshly_authenticated(validator)
-    requires: validator != entry.owner
-    requires: validator != model_version.first_release.authored_by
-    requires: outcome = approved_with_conditions implies conditions != null
-    requires: benchmark_tolerance > 0
-    ensures: ModelValidation.created(
-        entry: entry,
-        model_version: model_version,
-        validator: validator,
-        outcome: outcome,
-        scope_hash: scope_hash,
-        conditions: conditions,
-        conditions_due_at: conditions_due_at,
-        benchmark_tolerance: benchmark_tolerance,
-        evidence_ref: evidence_ref,
-        validated_at: now,
-        valid_until: now + validation_interval(entry.tier),
-        state: current
-    )
-}
-
--- Exactly one current validation per model version.
-rule SupersedePreviousValidation {
-    when: validation: ModelValidation.created
-    ensures: ValidationSuperseding(
-        entry: validation.entry,
-        model_version: validation.model_version,
-        keep: validation
-    )
-}
-
-rule SupersedeOne {
-    when: ValidationSuperseding(entry, model_version, keep)
-    ensures:
-        for old in other_current_validations(model_version, keep):
-            ValidationReplaced(validation: old)
-}
-
-rule ReplaceValidation {
-    when: ValidationReplaced(validation)
-    requires: validation.state = current
-    ensures: validation.state = superseded
-}
-
--- A validation runs out: the owner is told at once. Releases already in
--- production keep running (a regulatory run is never stopped by a clock), but
--- no production release carrying this version can be activated until it is
--- validated again (05, gate below).
-rule ValidationExpires {
-    -- model: release_gate.expire
-    when: validation: ModelValidation.valid_until <= now
-    requires: validation.state = current
-    ensures:
-        validation.state = expired
-        review/Alert.created(
-            source: run_problem,
-            subject_ref: validation.entry.function_name,
-            description: "model validation has expired",
-            raised_at: now,
-            owner: validation.entry.owner,
-            escalated: false,
-            alert_state: raised
-        )
-}
-
-rule WithdrawValidation {
-    -- model: release_gate.withdraw
-    when: ValidationWithdrawn(validator, validation, reason)
-    requires: validation.state = current
-    requires: data/permitted(validator, "model.validate", validation.entry.function_name)
-    requires: data/freshly_authenticated(validator)
-    ensures:
-        validation.state = withdrawn
-        review/Alert.created(
-            source: run_problem,
-            subject_ref: validation.entry.function_name,
-            description: reason,
-            raised_at: now,
-            owner: validation.entry.owner,
-            escalated: false,
-            alert_state: raised
-        )
-}
-
-rule ConditionsOverdue {
-    when: validation: ModelValidation.conditions_due_at <= now
-    requires: validation.state = current
-    requires: validation.outcome = approved_with_conditions
-    ensures: review/Alert.created(
-        source: run_problem,
-        subject_ref: validation.entry.function_name,
-        description: "condition of a model validation is overdue",
-        raised_at: now,
-        owner: validation.entry.owner,
-        escalated: false,
-        alert_state: raised
-    )
-}
-
--- Benchmarking: scheduled by tier against the independent reference.
-rule BenchmarkDue {
-    when: entry: ModelInventoryEntry.next_benchmark_due <= now
-    requires: entry.status = in_inventory
-    ensures: BenchmarkRequested(entry: entry)
-}
-
-rule RecordBenchmark {
-    when: BenchmarkRecorded(worker, entry, validation, cases, max_difference)
-    requires: validation.entry = entry
-    requires: validation.state = current
-    requires: data/permitted(worker, "model.benchmark", entry.function_name)
-    ensures:
-        BenchmarkRun.created(
-            entry: entry,
-            validation: validation,
-            cases: cases,
-            max_difference: max_difference,
-            tolerance: validation.benchmark_tolerance,
-            within_tolerance: max_difference <= validation.benchmark_tolerance,
-            run_at: now
-        )
-        entry.next_benchmark_due = now + benchmark_interval(entry.tier)
-}
-
-rule RaiseBreach {
-    -- model: release_gate.benchmarkOutside
-    when: run: BenchmarkRun.created
-    requires: not run.within_tolerance
-    ensures:
-        ModelBreach.created(
-            entry: run.entry,
-            benchmark: run,
-            raised_at: now,
-            state: open
-        )
-        review/Alert.created(
-            source: run_problem,
-            subject_ref: run.entry.function_name,
-            description: "model benchmark outside tolerance",
-            raised_at: now,
-            owner: run.entry.owner,
-            escalated: false,
-            alert_state: raised
-        )
-}
-
-rule ReviewBreach {
-    -- model: release_gate.reviewBreach
-    when: BreachReviewed(reviewer, breach, note)
-    requires: breach.state = open
-    requires: data/permitted(reviewer, "model.validate", breach.entry.function_name)
-    requires: reviewer != breach.entry.owner
-    requires: data/freshly_authenticated(reviewer)
-    ensures:
-        breach.state = reviewed
-        breach.reviewed_by = reviewer
-        breach.review_note = note
-}
-
-------------------------------------------------------------
--- Invariants
-------------------------------------------------------------
-
-invariant ValidatorIsIndependent {
-    -- model: release_gate.validatorIndependent
-    for v in ModelValidations:
-        v.validator != v.entry.owner
-            and v.validator != v.model_version.first_release.authored_by
-}
-
-invariant ReviewerIsIndependent {
-    -- model: release_gate.reviewerIndependent
-    for b in ModelBreachs:
-        b.state = reviewed implies b.reviewed_by != b.entry.owner
-}
-
 ------------------------------------------------------------
 -- Actor Declarations
 ------------------------------------------------------------
@@ -409,42 +173,6 @@ actor BenchmarkWorker {
 -- Surfaces
 ------------------------------------------------------------
 
-surface ModelValidation_ {
-    facing validator: ModelValidator
-    context validation: ModelValidation
-
-    exposes:
-        validation.entry.function_name
-        validation.entry.tier
-        validation.model_version.version
-        validation.outcome
-        validation.scope_hash
-        validation.conditions
-        validation.conditions_due_at
-        validation.benchmark_tolerance
-        validation.valid_until
-        validation.state
-
-    provides:
-        ValidationRecorded(validator, entry, model_version, outcome, scope_hash, conditions?, conditions_due_at?, benchmark_tolerance, evidence_ref)
-        ValidationWithdrawn(validator, validation, reason) when validation.state = current
-}
-
-surface ModelBreaches {
-    facing validator: ModelValidator
-    context breach: ModelBreach
-
-    exposes:
-        breach.entry.function_name
-        breach.benchmark.max_difference
-        breach.benchmark.tolerance
-        breach.raised_at
-        breach.state
-
-    provides:
-        BreachReviewed(validator, breach, note) when breach.state = open
-}
-
 surface ModelInventoryView {
     facing owner: ModelOwner
     context entry: ModelInventoryEntry where owner = owner
@@ -460,18 +188,6 @@ surface ModelInventoryView {
 
     contracts:
         demands ModelGovernance
-}
-
-surface BenchmarkComputation {
-    facing worker: BenchmarkWorker
-
-    provides:
-        BenchmarkRecorded(worker, entry, validation, cases, max_difference)
-
-    @guarantee ReferenceIsIndependent
-        -- The worker's reference values come from the independent
-        -- implementation, with its inputs frozen (D-049); a benchmark that
-        -- used the model's own code is not accepted.
 }
 
 ------------------------------------------------------------

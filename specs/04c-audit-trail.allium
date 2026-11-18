@@ -1,0 +1,121 @@
+-- allium: 3
+-- 04c-audit-trail.allium
+
+-- Scope: The audit log, its signed and externally anchored checkpoints and
+--   reads of the log by auditors. Part of 04.
+
+use "./04-identity-access-audit.allium" as iam
+use "./04b-break-glass.allium" as bg
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The audit log as a whole: one instance, used for daily checkpoints.
+entity AuditLog {
+    last_checkpoint_at: Timestamp
+}
+
+-- Daily signed checkpoint of the chain, anchored outside Veridian (D-026).
+entity AuditCheckpoint {
+    up_to_sequence: Integer
+    chain_hash: String
+    signature: String
+    anchor_ref: String
+    created_at: Timestamp
+}
+
+-- Append-only, hash-chained record. Every allowed, denied or failed action is
+-- one event; nothing is ever updated or removed.
+entity AuditEvent {
+    sequence: Integer
+    previous_hash: String
+    event_hash: String
+    actor: iam/User
+    action: String
+    target_ref: String
+    outcome: iam/Outcome
+    reason: String?
+    occurred_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule SignAuditCheckpoint {
+    when: log: AuditLog.last_checkpoint_at + iam/config.checkpoint_interval <= now
+    let last = latest_audit_event()
+    ensures:
+        AuditCheckpoint.created(
+            up_to_sequence: next_sequence(last) - 1,
+            chain_hash: hash_of(last),
+            signature: sign(hash_of(last)),
+            anchor_ref: anchor_externally(hash_of(last)),
+            created_at: now
+        )
+        log.last_checkpoint_at = now
+}
+
+-- Every decision of permitted(...) anywhere in Veridian, allowed or denied,
+-- and every failure of an attempted action, is appended to the chain.
+-- Reads are recorded only for production and regulatory data (D-026).
+rule RecordAudit {
+    when: ActionAttempted(actor, action, target_ref, outcome, reason?)
+    let last = latest_audit_event()
+    ensures: AuditEvent.created(
+        sequence: next_sequence(last),
+        previous_hash: hash_of(last),
+        event_hash: chain_hash(last, actor, action, target_ref, outcome, now),
+        actor: actor,
+        action: action,
+        target_ref: target_ref,
+        outcome: outcome,
+        reason: reason,
+        occurred_at: now
+    )
+}
+
+-- Reading the audit log is itself an audited action.
+rule AuditorReadsLog {
+    when: AuditLogRead(auditor, range_ref)
+    requires: permitted(auditor, "audit.read", range_ref)
+    ensures: ActionAttempted(actor: auditor, action: "audit.read", target_ref: range_ref, outcome: allowed)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant AuditSequenceUnique {
+    for a in AuditEvents:
+        for b in AuditEvents:
+            a != b implies a.sequence != b.sequence
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface AuditTrail {
+    facing auditor: iam/Auditor
+    context event: AuditEvent
+
+    exposes:
+        event.sequence
+        event.actor.display_name
+        event.action
+        event.target_ref
+        event.outcome
+        event.reason
+        event.occurred_at
+        event.previous_hash
+        event.event_hash
+
+    provides:
+        AuditLogRead(auditor, range_ref)
+
+    @guarantee TamperEvident
+        -- Recomputing chain_hash over the events in sequence order reproduces
+        -- every event_hash; any edit, insertion or deletion breaks the chain.
+}

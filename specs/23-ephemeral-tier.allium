@@ -1,0 +1,223 @@
+-- allium: 3
+-- 23-ephemeral-tier.allium
+
+-- Scope: A short-lived tier of calculation nodes for interactive work, so that
+--   intraday recomputation does not grow the durable ledger for ever (D-066,
+--   gap review item 4).
+-- Includes: which nodes are ephemeral, how a durable run adopts an ephemeral
+--   node (promotion), expiry by time and eviction by size.
+-- Excludes:
+--   - The ledger, retention and recomputation of durable nodes
+--     (02, 02b, 02c).
+--   - Measuring the tier's store and alerting at 70% full: the ephemeral store
+--     is one more store measured by 20-production-operations (StorageMeasured).
+--   - Desk views and what-if (14) and impact runs (24): they are the
+--     ephemeral requests, and are not changed by this spec.
+-- Dependencies: 02-calculation-graph.allium, 02b-node-execution.allium.
+--
+-- The rule (user choice, D-066): the purpose of the request that creates a node
+-- decides its tier. Batch runs, restatements and reproductions, reconciliations
+-- and regulatory reports are durable: a full ledger node with attempt log and
+-- retention as in 02c. Desk views, what-if scenarios and impact runs are
+-- ephemeral. A request with no origin_ref is durable, the safe choice.
+-- A node created by both kinds of request is durable.
+--
+-- The ageing of 02c (hot, cold, purged) applies to durable nodes; the TTL here
+-- must stay far below the hot retention, so ageing never reaches an ephemeral node.
+-- An ephemeral node is the same entity as any node (same calc_id, same
+-- recipe and attempt log while it lives); what differs is that it may
+-- disappear. An evicted or expired node is simply recomputed on demand.
+
+use "./02-calculation-graph.allium" as graph
+use "./02b-node-execution.allium" as exec
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Present for every node that is, or was when promoted, in the ephemeral
+-- tier. Durable nodes that were never ephemeral have none.
+entity EphemeralNode {
+    node: graph/CalculationNode
+    created_at: Timestamp
+    last_used_at: Timestamp
+    expires_at: Timestamp
+    size_bytes: Integer
+    state: ephemeral | promoted
+
+    transitions state {
+        ephemeral -> promoted
+        terminal: promoted
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+-- Placeholders until production sizing (as in D-048).
+config {
+    -- How long after its last use an unused ephemeral node is kept. One
+    -- business day in the design, written here as hours because calendars are
+    -- owned by Julia (03).
+    ephemeral_ttl: Duration = 24.hours
+    -- Most bytes the tier may hold; beyond it the least recently used evictable
+    -- nodes go.
+    ephemeral_cap_bytes: Integer = 50_000_000_000
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A new node is ephemeral when no durable request wants it.
+rule ClassifyNewNode {
+    -- model: ephemeral_tier.create
+    when: node: graph/CalculationNode.created
+    requires: not node.steps.any(s => durable_request(s.request))
+    ensures:
+        EphemeralNode.created(
+            node: node,
+            created_at: now,
+            last_used_at: now,
+            expires_at: now + config.ephemeral_ttl,
+            size_bytes: node_size(node),
+            state: ephemeral
+        )
+        EphemeralTierChanged()
+}
+
+-- An interactive step that finds an ephemeral node keeps it alive.
+rule TouchOnInteractiveReuse {
+    -- model: ephemeral_tier.reuse
+    when: step: graph/PlannedStep.memo_hit becomes true
+    requires: not durable_request(step.request)
+    let e = EphemeralNode{node: step.node}
+    requires: exists e and e.state = ephemeral
+    ensures:
+        e.last_used_at = now
+        e.expires_at = now + config.ephemeral_ttl
+}
+
+-- A durable step that finds an ephemeral node adopts it instead of
+-- recomputing: same calc_id, same result.
+rule PromoteOnOfficialReuse {
+    -- model: ephemeral_tier.reuse
+    when: step: graph/PlannedStep.memo_hit becomes true
+    requires: durable_request(step.request)
+    let e = EphemeralNode{node: step.node}
+    requires: exists e and e.state = ephemeral
+    ensures: PromotionRequested(node: step.node, adopted_for: step.request)
+}
+
+-- Promotion reaches the node's recorded prerequisites, whatever other nodes
+-- the durable request bound itself: with early cutoff a durable request may
+-- reach the same result through different prerequisite nodes, and the adopted
+-- node must not point at nodes that can expire (provenance).
+rule PromoteNode {
+    -- model: ephemeral_tier.reuse
+    when: PromotionRequested(node, adopted_for)
+    let e = EphemeralNode{node: node}
+    requires: exists e and e.state = ephemeral
+    ensures:
+        e.state = promoted
+        for p in node.prerequisite_nodes:
+            PromotionRequested(node: p, adopted_for: adopted_for)
+}
+
+-- Time: an unused node goes. Never under a running step, and never while
+-- another node still names it as a prerequisite, so no node is left pointing
+-- at a missing one; a requester whose old result has expired refreshes.
+rule ExpireEphemeralNode {
+    -- model: ephemeral_tier.expire
+    when: e: EphemeralNode.expires_at <= now
+    requires: e.state = ephemeral
+    requires: not e.node.steps.any(s => s.status = running)
+    requires: not graph/CalculationNodes.any(n => n.prerequisite_nodes.contains(e.node))
+    ensures:
+        -- The node goes with its payload and its attempt records (this amends
+        -- D-005, which keeps node records: that holds for durable nodes).
+        not exists e.node
+        not exists e
+        EphemeralTierChanged()
+}
+
+-- A step that ends unpins its node, so the cap is checked again.
+rule RecheckTierWhenStepEnds {
+    -- model: ephemeral_tier.endStep
+    when: step: graph/PlannedStep.status becomes done
+    ensures: EphemeralTierChanged()
+}
+
+rule RecheckTierWhenStepAbandoned {
+    -- model: ephemeral_tier.endStep
+    when: step: graph/PlannedStep.status becomes abandoned
+    ensures: EphemeralTierChanged()
+}
+
+-- Size: while over the cap, the least recently used node that may go is
+-- evicted, under the same guards as expiry. The tier may stay over the cap
+-- when every node is pinned; spec 20's storage measurement alerts on that.
+rule EvictWhenOverCap {
+    -- model: ephemeral_tier.settle
+    when: EphemeralTierChanged()
+    requires: tier_used_bytes() > config.ephemeral_cap_bytes
+    let victim = least_recently_used_evictable()
+    requires: victim != null
+    ensures:
+        -- With its payload and attempt records, as for expiry.
+        not exists victim.node
+        not exists victim
+        EphemeralTierChanged()
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- A node that is not ephemeral never points at an ephemeral one.
+invariant DurableNodesHaveDurablePrerequisites {
+    -- model: ephemeral_tier.durablePrereqsDurable
+    for n in graph/CalculationNodes:
+        (not exists EphemeralNode{node: n, state: ephemeral})
+            implies n.prerequisite_nodes.all(p => not exists EphemeralNode{node: p, state: ephemeral})
+}
+
+-- A durable request never works on an ephemeral node.
+invariant DurableRequestsUseDurableNodes {
+    -- model: ephemeral_tier.durableUsesDurable
+    for s in graph/PlannedSteps:
+        (durable_request(s.request) and s.status in {running, done})
+            implies not exists EphemeralNode{node: s.node, state: ephemeral}
+}
+
+-- No node is left pointing at a missing prerequisite, and no running step at a
+-- missing node.
+invariant NothingDangles {
+    -- model: ephemeral_tier.noDangling
+    for n in graph/CalculationNodes:
+        n.prerequisite_nodes.all(p => exists p)
+}
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black boxes owned by Elixir:
+--   durable_request(request): false when origin_ref names a desk view, a
+--     what-if scenario, an impact run or an ad-hoc stress (14, 24, 25); true
+--     for a batch run, a scheduled stress (25),
+--     restatement, reproduction, reconciliation or regulatory report, and
+--     for a request with no origin_ref.
+--   node_size(node): bytes the node's record and payload take.
+--   tier_used_bytes(): sum of size_bytes of the ephemeral nodes.
+--   least_recently_used_evictable(): the ephemeral node with the oldest
+--     last_used_at that has no running step and is no node's prerequisite, or
+--     null.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "When the tier is over its cap and every node is pinned (running step or named as a prerequisite), should new interactive requests be refused until space frees, or is an alert enough (as written)?"
+open question "A fulfilled interactive request keeps references to nodes that later expire, so an old desk view result cannot be shown again after the TTL. Is a refresh on open always acceptable, or must a what-if result survive until its author discards it?"

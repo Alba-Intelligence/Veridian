@@ -10,6 +10,10 @@
 //
 // What is not modelled: priorities beyond "lowest id first", build
 // compatibility, memo hits, time, backpressure, host presence, recycling.
+// A ticket is the same whatever its purpose (D-071): a recomputation ticket
+// (a purged payload to rebuild, 02c) is held, reported, committed and lost like
+// a computation ticket; only the event the graph receives at the end differs, and
+// that is outside this model.
 //
 // Two instances at the bottom. `dispatch` is the behaviour of spec 07 (D-056):
 // when a worker is declared lost, its held tickets and its reported but
@@ -82,7 +86,7 @@ module bundled_dispatch {
   }
 
   // AssignJob: an idle worker takes up to BUNDLE queued nodes, lowest id first.
-  // spec: 07-julia-workers#AssignJob, 07-julia-workers#BundledDispatch
+  // spec: 07d-job-dispatch#AssignJob, 07-julia-workers#BundledDispatch
   action takeBundle(w: str): bool = {
     val queued = NODES.filter(n => nodeSt.get(n) == Queued)
     val take = queued.filter(n => queued.filter(m => m < n).size() < BUNDLE)
@@ -112,7 +116,7 @@ module bundled_dispatch {
 
   // The control plane receives a result. A result from a worker declared lost,
   // or for a ticket it no longer holds, is ignored (LivenessFromHeartbeat).
-  // spec: 07-julia-workers#JobSucceeds, 07-julia-workers#LivenessFromHeartbeat
+  // spec: 07d-job-dispatch#JobSucceeds, 07b-compute-hosts#LivenessFromHeartbeat
   action receive(w: str, n: int): bool = all {
     inflight.contains((w, n)),
     inflight' = inflight.exclude(Set((w, n))),
@@ -126,8 +130,8 @@ module bundled_dispatch {
 
   // BatchedLedgerWrite: once every ticket of the bundle is reported, the
   // completions are recorded in one transaction; the worker is then free.
-  // spec: 07-julia-workers#BatchedLedgerWrite, 07-julia-workers#BundleFinished
-  // spec: 07-julia-workers#BundleCommitted
+  // spec: 07-julia-workers#BatchedLedgerWrite, 07d-job-dispatch#BundleFinished
+  // spec: 07d-job-dispatch#BundleCommitted
   action commitBundle(w: str): bool = {
     val batch = reportedBy(w)
     all {
@@ -146,7 +150,7 @@ module bundled_dispatch {
 
   // The worker process exits (crash, out-of-memory kill). Results already sent
   // stay in flight.
-  // spec: 07-julia-workers#WorkerExitReported
+  // spec: 07d-job-dispatch#WorkerExitReported
   action procDies(w: str): bool = all {
     procAlive.get(w),
     faultCount < MAX_FAULTS,
@@ -159,8 +163,8 @@ module bundled_dispatch {
 
   // Heartbeat timeout: the host is declared lost. This is enabled whether or
   // not the process is really dead (false timeout).
-  // spec: 07-julia-workers#HostSilent, 07-julia-workers#HostLost
-  // spec: 07-julia-workers#WorkerDies
+  // spec: 07b-compute-hosts#HostSilent, 07b-compute-hosts#HostLost
+  // spec: 07d-job-dispatch#WorkerDies
   action declareLost(w: str): bool = all {
     cpLive.get(w),
     faultCount < MAX_FAULTS,
@@ -194,7 +198,7 @@ module bundled_dispatch {
   // ------------------------------------------------------------
 
   // BundleWithinLimit (spec 07).
-  // spec: 07-julia-workers#BundleWithinLimit
+  // spec: 07d-job-dispatch#BundleWithinLimit
   val bundleWithinLimit =
     WORKERS.forall(w => assignedTo(w).size() <= BUNDLE)
 

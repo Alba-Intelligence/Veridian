@@ -24,6 +24,7 @@ use "./01-bitemporal-data.allium" as data
 use "./02-calculation-graph.allium" as graph
 use "./06-batch-scheduling.allium" as batch
 use "./07-julia-workers.allium" as workers
+use "./07b-compute-hosts.allium" as hosts
 
 ------------------------------------------------------------
 -- Contracts
@@ -182,7 +183,7 @@ surface FailedNodeDetail {
 -- Compute capacity: hosts, their allocations and workers (07).
 surface CapacityMonitor {
     facing operator: batch/BatchOperator
-    context host: workers/ComputeHost
+    context host: hosts/ComputeHost
 
     exposes:
         host.node_name

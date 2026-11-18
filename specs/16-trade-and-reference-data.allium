@@ -161,7 +161,7 @@ config {
 rule RecordDelivery {
     when: DeliveryReceived(adapter, source, business_date, delivery_kind, run)
     requires: adapter = source.adapter_identity
-    requires: source.feed in {trades, positions, hierarchy, parties, securities, ratings}
+    requires: source.feed in {trades, positions, hierarchy, parties, securities, ratings, pnl_adjustments}
     requires: run.source = source
     requires: not exists FeedDelivery{source: source, business_date: business_date, delivery_kind: snapshot, ingestion: run}
     ensures:

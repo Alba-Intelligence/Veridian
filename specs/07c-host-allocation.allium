@@ -1,0 +1,123 @@
+-- allium: 3
+-- 07c-host-allocation.allium
+
+-- Scope: Grid allocations and elasticity: scale out and in, the end-of-day
+--   array, late and refused allocations. Part of the Julia worker spec
+--   (07-julia-workers); see its header for the principles.
+-- Dependencies: 01, 02, 05, 06, 07, 07b.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./07-julia-workers.allium" as core
+use "./07b-compute-hosts.allium" as hosts
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- The allocation ends with its last host (a batch of hosts together).
+rule ReleaseAllocation {
+    when: host: hosts/ComputeHost.presence becomes gone
+    requires: exists host.allocation
+    let allocation = host.allocation
+    requires: allocation.state = granted
+    requires: allocation.live_hosts.count = 0
+    ensures:
+        allocation.state = released
+        allocation.ended_at = now
+}
+
+-- Elasticity signal: sustained queue pressure asks for a host, sustained idle
+-- capacity releases one. At most one request is outstanding at a time.
+rule ScaleOut {
+    when: hosts/QueuePressureObserved(supervisor, queued, capacity)
+    requires: queued > capacity * core/config.scale_out_factor
+    requires: serving_hosts() < core/config.max_hosts
+    requires: not exists hosts/HostAllocation{state: submitted, array_size: 1}
+    ensures: HostRequested(reason: "queue pressure")
+}
+
+rule SubmitAllocation {
+    when: HostRequested(reason)
+    ensures: hosts/HostAllocation.created(
+        reason: reason,
+        requested_at: now,
+        state: submitted,
+        slow_alerted: false,
+        array_size: 1,
+        needed_by: null,
+        late_alerted: false
+    )
+}
+
+-- A regulatory run's peak: one batch request for all its hosts, made ahead of
+-- the cut-off by the schedule (06, RequestRunCapacity) under the higher
+-- quality of service (D-039, D-045).
+rule SubmitEodArray {
+    when: batch/RunCapacityNeeded(schedule, workers, needed_by)
+    ensures: hosts/HostAllocation.created(
+        reason: "regulatory run: " + schedule.name,
+        requested_at: now,
+        state: submitted,
+        slow_alerted: false,
+        array_size: hosts_for_workers(workers),
+        needed_by: needed_by,
+        late_alerted: false
+    )
+}
+
+-- Capacity that is not all serving by the cut-off is reported at once,
+-- complete or partial: the run starts regardless, with what it has.
+rule EodArrayLate {
+    when: allocation: hosts/HostAllocation.needed_by <= now
+    requires: allocation.state in {submitted, granted}
+    requires: allocation.serving_now.count < allocation.array_size
+    requires: not allocation.late_alerted
+    ensures:
+        allocation.late_alerted = true
+        HostSupplyLate(allocation: allocation, serving: allocation.serving_now.count)
+}
+
+rule AllocationGranted {
+    when: hosts/AllocationStarted(supervisor, allocation, scheduler_ref, walltime_ends_at)
+    requires: allocation.state = submitted
+    ensures:
+        allocation.state = granted
+        allocation.scheduler_ref = scheduler_ref
+        allocation.walltime_ends_at = walltime_ends_at
+}
+
+-- Refused or cancelled by the grid: operations are told; the queue keeps
+-- its backpressure and the next pressure signal may ask again.
+rule AllocationRefused {
+    when: hosts/AllocationDenied(supervisor, allocation, reason)
+    requires: allocation.state = submitted
+    ensures:
+        allocation.state = refused
+        allocation.ended_at = now
+        HostSupplyFailed(allocation: allocation, reason: reason)
+}
+
+rule AllocationSlow {
+    when: allocation: hosts/HostAllocation.requested_at + core/config.allocation_wait_alert <= now
+    requires: allocation.state = submitted
+    requires: not allocation.slow_alerted
+    ensures:
+        allocation.slow_alerted = true
+        HostSupplySlow(allocation: allocation)
+}
+
+rule ScaleIn {
+    when: hosts/IdleCapacityObserved(supervisor, host)
+    requires: host.presence = serving
+    requires: serving_hosts() > core/config.min_hosts
+    ensures: hosts/HostRetirementRequested(supervisor: supervisor, host: host)
+}
+
+rule DrainIdleWorker {
+    when: hosts/WorkerDrainRequested(worker)
+    requires: worker.lifecycle = idle
+    ensures: worker.lifecycle = draining
+}

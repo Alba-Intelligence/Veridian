@@ -17,19 +17,17 @@
 // What is not modelled: planning and plan expansion (a request starts with its
 // two steps), bitemporal resolution, data classes, queue capacity, wall-clock
 // time (timeouts are crashes, ageing is nondeterministic), the worker protocol
-// of spec 07 (see bundled_dispatch.qnt), payload references.
+// of spec 07 (see bundled_dispatch.qnt), payload references, attempt records and
+// run environments (D-064), and inspection reruns (they use the same
+// recomputation as a waiting step, without a step).
 //
 // Authority (D-055): this model is authoritative for the behaviour it covers.
 //
-// Instances. `calc_graph_fixed` is the behaviour (D-062: one recomputation per
-// purged payload, and a step bound to an irreproducible node is abandoned at
-// binding). The `calc_graph_mutant_*` instances are negative controls, not
-// behaviour: each removes one control and the gate requires it to violate the
-// matching property or scenario, so the properties are known to have teeth:
-// `no_stampede` (oneInFlight), `dup_remat` (spec 02 as written before D-062:
-// every binding step dispatches its own recomputation; oneRematInFlight) and
-// `remat_broken` (as written before D-062: a recomputation is dispatched for an
-// irreproducible node; noRematOnBroken).
+// Split (D-065): the instances, including the negative controls, are in
+// calc_graph_instances.qnt; the scenarios (quint test) are in
+// calc_graph_scenarios.qnt. A late answer from a worker given up on is not
+// modelled: the same hash is harmless and an answer for a payload that is no
+// longer purged is dropped.
 
 module calc_graph {
   const REQS: Set[int]
@@ -37,7 +35,8 @@ module calc_graph {
   const RESULT: int -> int         // result_hash of the A node, by input
   const MAX_ATTEMPTS: int
   const VARIANT: str               // "fixed", or the removed control: "mutant_no_stampede",
-                                   // "mutant_dup_remat", "mutant_remat_broken"
+                                   // "mutant_dup_remat", "mutant_remat_broken",
+                                   // "mutant_remat_lost"
 
   type ReqSt = | NoReq | Open | Fulfilled | Unfulfilled
   type StepSt = | NoStep | Waiting | Running | Done | Abandoned | Cancelled
@@ -64,6 +63,8 @@ module calc_graph {
   var badDone: bool                    // ghost: a step became done on an irreproducible node
   var memoHit: bool                    // ghost, for witnesses
   var attachedLive: bool
+  var rematAttempts: int -> int        // dispatches of the current recomputation cycle (D-063)
+  var rematLost: int -> bool           // ghost: a cycle for this node ran out of attempts
   var rematOk: bool
   var rematBad: bool                   // ghost: a recomputation was dispatched for an irreproducible node
 
@@ -92,7 +93,9 @@ module calc_graph {
   action keepStep = all { stepSt' = stepSt, stepNode' = stepNode }
   action keepNode = all { nodeSt' = nodeSt, attempts' = attempts, resultHash' = resultHash }
   action keepPay = all { reproducible' = reproducible, tier' = tier }
-  action keepRemat = rematInFlight' = rematInFlight
+  action keepRemat = all {
+    rematInFlight' = rematInFlight, rematAttempts' = rematAttempts, rematLost' = rematLost,
+  }
   action keepFly = inFlight' = inFlight
   action keepCreated = created' = created
   action keepFlags = all {
@@ -114,6 +117,8 @@ module calc_graph {
     reproducible' = ALL.mapBy(n => true),
     tier' = ALL.mapBy(n => NoPayload),
     rematInFlight' = ALL.mapBy(n => 0),
+    rematAttempts' = ALL.mapBy(n => 0),
+    rematLost' = ALL.mapBy(n => false),
     inFlight' = ALL.mapBy(n => 0),
     created' = ALL.mapBy(n => 0),
     badDone' = false,
@@ -134,7 +139,7 @@ module calc_graph {
   }
 
   // A ready step finds no node for its calc_id: exactly one new node is created.
-  // spec: 02-calculation-graph#StepBindsToNode
+  // spec: 02b-node-execution#StepBindsToNode
   action bindNew(r: int, k: int): bool = all {
     reqSt.get(r) == Open,
     stepSt.get((r, k)) == Waiting,
@@ -155,7 +160,7 @@ module calc_graph {
   // rematerialise a purged payload, or inherit a failure. A node that is
   // irreproducible fails its steps at once, and a purged payload is recomputed
   // once however many steps wait for it (D-062).
-  // spec: 02-calculation-graph#StepBindsToNode, 02-calculation-graph#RematerialisationDispatched
+  // spec: 02b-node-execution#StepBindsToNode, 02c-payload-retention#RematerialisationDispatched
   action bindExisting(r: int, k: int): bool = {
     val id = idOf(r, k)
     val ns = nodeSt.get(id)
@@ -182,6 +187,11 @@ module calc_graph {
             if (dupOk) rematInFlight.get(id) + 1
             else (if (rematInFlight.get(id) == 0) 1 else rematInFlight.get(id)))
         else rematInFlight,
+      // The first binding step starts a cycle: its first dispatch counts.
+      rematAttempts' =
+        if (wantsRemat and rematInFlight.get(id) == 0) rematAttempts.set(id, 1)
+        else rematAttempts,
+      rematLost' = rematLost,
       inFlight' =
         if (VARIANT == "mutant_no_stampede" and ns == Computing)
           inFlight.set(id, inFlight.get(id) + 1)
@@ -195,7 +205,7 @@ module calc_graph {
     }
   }
 
-  // spec: 02-calculation-graph#DispatchNode
+  // spec: 02b-node-execution#DispatchNode
   action dispatch(n: int): bool = all {
     nodeSt.get(n) == Pending,
     attempts.get(n) < MAX_ATTEMPTS,
@@ -206,7 +216,7 @@ module calc_graph {
     keepReq, keepStep, keepPay, keepRemat, keepCreated, keepFlags,
   }
 
-  // spec: 02-calculation-graph#ComputationSucceeds
+  // spec: 02b-node-execution#ComputationSucceeds
   action succeed(n: int): bool = all {
     nodeSt.get(n) == Computing,
     nodeSt' = nodeSt.set(n, Complete),
@@ -219,7 +229,7 @@ module calc_graph {
   }
 
   // Infrastructure failure, including a timeout: retry while attempts remain.
-  // spec: 02-calculation-graph#ComputationCrashes, 02-calculation-graph#ComputationTimesOut
+  // spec: 02b-node-execution#ComputationCrashes, 02b-node-execution#ComputationTimesOut
   action crash(n: int): bool = all {
     nodeSt.get(n) == Computing,
     nodeSt' = nodeSt.set(n, if (attempts.get(n) < MAX_ATTEMPTS) Pending else Failed),
@@ -230,7 +240,7 @@ module calc_graph {
   }
 
   // Deterministic rejection: terminal at once.
-  // spec: 02-calculation-graph#ComputationRejects
+  // spec: 02b-node-execution#ComputationRejects
   action reject(n: int): bool = all {
     nodeSt.get(n) == Computing,
     nodeSt' = nodeSt.set(n, Failed),
@@ -240,7 +250,7 @@ module calc_graph {
     keepReq, keepStep, keepPay, keepRemat, keepCreated, keepFlags,
   }
 
-  // spec: 02-calculation-graph#PayloadMovesToColdStorage
+  // spec: 02c-payload-retention#PayloadMovesToColdStorage
   action cool(n: int): bool = all {
     nodeSt.get(n) == Complete,
     tier.get(n) == Hot,
@@ -249,10 +259,12 @@ module calc_graph {
     keepReq, keepStep, keepNode, keepRemat, keepFly, keepCreated, keepFlags,
   }
 
-  // spec: 02-calculation-graph#PayloadPurged
+  // A payload is not purged under a step still running on its node (D-063).
+  // spec: 02c-payload-retention#PayloadPurged
   action purge(n: int): bool = all {
     nodeSt.get(n) == Complete,
     tier.get(n) == Cold,
+    not(STEPS.exists(s => stepSt.get(s) == Running and stepNode.get(s) == n)),
     tier' = tier.set(n, Purged),
     reproducible' = reproducible,
     keepReq, keepStep, keepNode, keepRemat, keepFly, keepCreated, keepFlags,
@@ -261,10 +273,12 @@ module calc_graph {
   // The answer of a recomputation: the same hash restores the payload; a
   // different one marks the node irreproducible. An answer for a payload that
   // is no longer purged is dropped.
-  // spec: 02-calculation-graph#RematerialisationSucceeds, 02-calculation-graph#MarkNodeIrreproducible
+  // spec: 02c-payload-retention#RematerialisationSucceeds, 02c-payload-retention#MarkNodeIrreproducible
   action rematAnswer(n: int, same: bool): bool = all {
     rematInFlight.get(n) > 0,
     rematInFlight' = rematInFlight.set(n, rematInFlight.get(n) - 1),
+    rematAttempts' = rematAttempts.set(n, 0),
+    rematLost' = rematLost,
     tier' = if (tier.get(n) == Purged and same) tier.set(n, Hot) else tier,
     reproducible' =
       if (tier.get(n) == Purged and not(same)) reproducible.set(n, false) else reproducible,
@@ -274,9 +288,44 @@ module calc_graph {
     keepReq, keepStep, keepNode, keepFly, keepCreated,
   }
 
+  // A recomputation is lost (crash, lost host or timeout). While attempts
+  // remain it is dispatched again. When they run out the cycle ends: the steps
+  // waiting for the payload are abandoned, and the node stays reproducible; a
+  // later binding step starts a fresh cycle (D-063). The mutant
+  // `remat_lost` only drops the in-flight count and leaves the steps running.
+  // spec: 02c-payload-retention#RecomputationCrashes, 02c-payload-retention#RecomputationTimesOut
+  action rematCrash(n: int): bool = {
+    val retry = VARIANT != "mutant_remat_lost" and rematAttempts.get(n) < MAX_ATTEMPTS
+    val strand = VARIANT == "mutant_remat_lost"
+    all {
+      rematInFlight.get(n) > 0,
+      tier.get(n) == Purged,
+      rematAttempts' = if (retry) rematAttempts.set(n, rematAttempts.get(n) + 1) else rematAttempts.set(n, 0),
+      rematInFlight' = if (retry) rematInFlight else rematInFlight.set(n, rematInFlight.get(n) - 1),
+      rematLost' = if (retry or strand) rematLost else rematLost.set(n, true),
+      stepSt' =
+        if (retry or strand) stepSt
+        else STEPS.mapBy(s =>
+          if (stepSt.get(s) == Running and stepNode.get(s) == n) Abandoned else stepSt.get(s)),
+      stepNode' = stepNode,
+      keepReq, keepNode, keepPay, keepFly, keepCreated, keepFlags,
+    }
+  }
+
+  // An inspector reruns a purged payload: a cycle with no step waiting (D-064).
+  // spec: 02d-attempts-and-inspection#RerunRequested
+  action rerun(n: int): bool = all {
+    nodeSt.get(n) == Complete, tier.get(n) == Purged, reproducible.get(n),
+    rematInFlight.get(n) == 0,
+    rematInFlight' = rematInFlight.set(n, 1),
+    rematAttempts' = rematAttempts.set(n, 1),
+    rematLost' = rematLost,
+    keepReq, keepStep, keepNode, keepPay, keepFly, keepCreated, keepFlags,
+  }
+
   // A running step ends with its node: done when the result is available,
   // abandoned when the node failed or is irreproducible.
-  // spec: 02-calculation-graph#StepCompletesWithNode
+  // spec: 02b-node-execution#StepCompletesWithNode
   action stepDone(r: int, k: int): bool = all {
     stepSt.get((r, k)) == Running,
     nodeSt.get(stepNode.get((r, k))) == Complete,
@@ -287,7 +336,7 @@ module calc_graph {
     keepReq, keepNode, keepPay, keepRemat, keepFly, keepCreated, keepFlags,
   }
 
-  // spec: 02-calculation-graph#StepFailsWithNode
+  // spec: 02b-node-execution#StepFailsWithNode
   action stepAbandon(r: int, k: int): bool = all {
     stepSt.get((r, k)) == Running,
     (nodeSt.get(stepNode.get((r, k))) == Failed
@@ -297,7 +346,7 @@ module calc_graph {
     keepReq, keepNode, keepPay, keepRemat, keepFly, keepCreated, keepFlags,
   }
 
-  // spec: 02-calculation-graph#RequestCompletes
+  // spec: 02b-node-execution#RequestCompletes
   action requestFulfil(r: int): bool = all {
     reqSt.get(r) == Open,
     stepsDone(r),
@@ -305,7 +354,7 @@ module calc_graph {
     keepStep, keepNode, keepPay, keepRemat, keepFly, keepCreated, keepFlags,
   }
 
-  // spec: 02-calculation-graph#RequestFails
+  // spec: 02b-node-execution#RequestFails
   action requestFail(r: int): bool = all {
     reqSt.get(r) == Open,
     anyAbandoned(r),
@@ -313,7 +362,7 @@ module calc_graph {
     keepStep, keepNode, keepPay, keepRemat, keepFly, keepCreated, keepFlags,
   }
 
-  // spec: 02-calculation-graph#CancelRequest
+  // spec: 02b-node-execution#CancelRequest
   action cancel(r: int): bool = all {
     reqSt.get(r) == Open,
     reqSt' = reqSt.set(r, Unfulfilled),
@@ -321,7 +370,7 @@ module calc_graph {
   }
 
   // Waiting steps of a failed request are cancelled; running ones keep going.
-  // spec: 02-calculation-graph#StepCancelledWithRequest
+  // spec: 02b-node-execution#StepCancelledWithRequest
   action stepCancel(r: int, k: int): bool = all {
     reqSt.get(r) == Unfulfilled,
     stepSt.get((r, k)) == Waiting,
@@ -346,6 +395,8 @@ module calc_graph {
       cool(n),
       purge(n),
       rematAnswer(n, same),
+      rematCrash(n),
+      rerun(n),
       stepDone(r, k),
       stepAbandon(r, k),
       requestFulfil(r),
@@ -359,22 +410,22 @@ module calc_graph {
   // Properties
   // ------------------------------------------------------------
 
-  // spec: 02-calculation-graph#AttemptsBounded
+  // spec: 02b-node-execution#AttemptsBounded
   val attemptsBounded = NODES.forall(n => attempts.get(n) <= MAX_ATTEMPTS)
 
   // One node per calc_id, however many steps and requests meet in it.
-  // spec: 02-calculation-graph#OneNodePerCalcId
+  // spec: 02b-node-execution#OneNodePerCalcId
   val oneNodePerCalcId = NODES.forall(n => created.get(n) <= 1)
 
   // Stampede control: a node is computed by one dispatch at a time.
   val oneInFlight = NODES.forall(n => inFlight.get(n) <= 1)
 
   // A purged payload is recomputed once, however many steps wait for it.
-  // spec: 02-calculation-graph#RematerialisationDispatched
+  // spec: 02c-payload-retention#RematerialisationDispatched
   val oneRematInFlight = NODES.forall(n => rematInFlight.get(n) <= 1)
 
   // No recomputation is dispatched for a node already known irreproducible.
-  // spec: 02-calculation-graph#NoRecomputationOfIrreproducibleNode
+  // spec: 02c-payload-retention#NoRecomputationOfIrreproducibleNode
   val noRematOnBroken = not(rematBad)
 
   // A step is never done on an irreproducible node, and a done step has a
@@ -386,11 +437,23 @@ module calc_graph {
   }
 
   // Ringfence: a step is abandoned only because its own node failed or is
-  // irreproducible.
+  // irreproducible, or because a recomputation of its payload ran out of
+  // attempts (D-063).
   val abandonedHasCause = STEPS.forall(s =>
     stepSt.get(s) != Abandoned
       or (nodeSt.get(stepNode.get(s)) == Failed
-          or not(reproducible.get(stepNode.get(s)))))
+          or not(reproducible.get(stepNode.get(s)))
+          or rematLost.get(stepNode.get(s))))
+
+  // A step waiting on a purged payload always has a recomputation in flight
+  // (D-063): a lost one is retried or ends the step, never leaves it waiting.
+  // spec: 02c-payload-retention#RecomputationCrashes
+  val purgedWaiterHasRemat = STEPS.forall(s =>
+    not(stepSt.get(s) == Running
+        and nodeSt.get(stepNode.get(s)) == Complete
+        and tier.get(stepNode.get(s)) == Purged
+        and reproducible.get(stepNode.get(s)))
+      or rematInFlight.get(stepNode.get(s)) > 0)
 
   val requestStatesAgree = and {
     REQS.forall(r => reqSt.get(r) != Fulfilled or stepsDone(r)),
@@ -399,7 +462,8 @@ module calc_graph {
 
   val safety = and {
     attemptsBounded, oneNodePerCalcId, oneInFlight, oneRematInFlight,
-    noRematOnBroken, doneIsSound, abandonedHasCause, requestStatesAgree,
+    noRematOnBroken, doneIsSound, abandonedHasCause, purgedWaiterHasRemat,
+    requestStatesAgree,
   }
 
   // ------------------------------------------------------------
@@ -419,132 +483,4 @@ module calc_graph {
     and INPUT.get(r1) != INPUT.get(r2)
     and stepNode.get((r1, 1)) != 0
     and stepNode.get((r1, 1)) == stepNode.get((r2, 1)))))
-
-  // ------------------------------------------------------------
-  // Scenarios (quint test). Random simulation does not reach the deeper
-  // sequences, so each finding is replayed step by step. Instance used: three
-  // requests, A ids 1 and 2, both with result hash 7, so one shared B node 107.
-  // ------------------------------------------------------------
-
-  action unchangedAll = all {
-    keepReq, keepStep, keepNode, keepPay, keepRemat, keepFly, keepCreated, keepFlags,
-  }
-
-  // Request 1 runs to completion: its A node 1 and the shared B node 107.
-  run firstRequest =
-    init
-      .then(submit(1)).then(submit(2)).then(submit(3))
-      .then(bindNew(1, 0)).then(dispatch(1)).then(succeed(1)).then(stepDone(1, 0))
-      .then(bindNew(1, 1)).then(dispatch(107)).then(succeed(107)).then(stepDone(1, 1))
-      .then(requestFulfil(1))
-
-  // Early cutoff: request 2 has another input but the same A result, so its B
-  // step lands on node 107 (one node created) and is a memo hit.
-  run earlyCutoffTest =
-    firstRequest
-      .then(bindNew(2, 0)).then(dispatch(2)).then(succeed(2)).then(stepDone(2, 0))
-      .then(bindExisting(2, 1))
-      .then(all {
-        assert(not(notEarlyCutoff) and created.get(107) == 1 and created.get(2) == 1
-          and stepSt.get((2, 1)) == Done),
-        unchangedAll,
-      })
-
-  // Two steps wait for the same purged payload: one recomputation (D-062). The
-  // mutant `dup_remat` dispatches one per binding step and must fail this.
-  run purgedTwiceTest =
-    firstRequest
-      .then(cool(107)).then(purge(107))
-      .then(bindNew(2, 0)).then(dispatch(2)).then(succeed(2)).then(stepDone(2, 0))
-      .then(bindExisting(2, 1))
-      .then(bindExisting(3, 0)).then(bindExisting(3, 1))
-      .then(all {
-        assert(rematInFlight.get(107) == 1 and oneRematInFlight),
-        unchangedAll,
-      })
-
-  // A recomputation disagrees, the node is irreproducible, and a later step
-  // binds to it: the step is abandoned at once and nothing is dispatched
-  // (D-062). The mutant `remat_broken` dispatches another recomputation and
-  // must fail this.
-  run brokenNodeTest =
-    firstRequest
-      .then(cool(107)).then(purge(107))
-      .then(bindNew(2, 0)).then(dispatch(2)).then(succeed(2)).then(stepDone(2, 0))
-      .then(bindExisting(2, 1))
-      .then(rematAnswer(107, false))
-      .then(bindExisting(3, 0)).then(bindExisting(3, 1))
-      .then(all {
-        assert(not(reproducible.get(107)) and noRematOnBroken
-          and stepSt.get((3, 1)) == Abandoned),
-        unchangedAll,
-      })
-
-  // A rejected node fails only the steps bound to it; the sibling request on
-  // another input is unaffected, and a failed request cancels its waiting step.
-  run ringfenceTest =
-    init
-      .then(submit(1)).then(submit(2))
-      .then(bindNew(1, 0)).then(dispatch(1)).then(reject(1))
-      .then(stepAbandon(1, 0)).then(requestFail(1)).then(stepCancel(1, 1))
-      .then(bindNew(2, 0)).then(dispatch(2)).then(succeed(2)).then(stepDone(2, 0))
-      .then(all {
-        assert(stepSt.get((1, 0)) == Abandoned and stepSt.get((1, 1)) == Cancelled
-          and reqSt.get(1) == Unfulfilled and stepSt.get((2, 0)) == Done
-          and reqSt.get(2) == Open),
-        unchangedAll,
-      })
-
-  // Retry: a crash returns the node to pending while attempts remain; at the
-  // limit the node fails.
-  run retryTest =
-    init
-      .then(submit(1)).then(bindNew(1, 0))
-      .then(dispatch(1)).then(crash(1)).then(dispatch(1)).then(crash(1))
-      .then(all {
-        assert(nodeSt.get(1) == Failed and attempts.get(1) == MAX_ATTEMPTS),
-        unchangedAll,
-      })
-}
-
-// Three requests: 1 and 3 share an input (memo, stampede); 1 and 2 differ in
-// input but their A results are equal (early cutoff, one shared B node).
-module calc_graph_fixed {
-  import calc_graph(
-    REQS = Set(1, 2, 3),
-    INPUT = Map(1 -> 1, 2 -> 2, 3 -> 1),
-    RESULT = Map(1 -> 7, 2 -> 7),
-    MAX_ATTEMPTS = 2,
-    VARIANT = "fixed"
-  ).*
-}
-
-module calc_graph_mutant_dup_remat {
-  import calc_graph(
-    REQS = Set(1, 2, 3),
-    INPUT = Map(1 -> 1, 2 -> 2, 3 -> 1),
-    RESULT = Map(1 -> 7, 2 -> 7),
-    MAX_ATTEMPTS = 2,
-    VARIANT = "mutant_dup_remat"
-  ).*
-}
-
-module calc_graph_mutant_remat_broken {
-  import calc_graph(
-    REQS = Set(1, 2, 3),
-    INPUT = Map(1 -> 1, 2 -> 2, 3 -> 1),
-    RESULT = Map(1 -> 7, 2 -> 7),
-    MAX_ATTEMPTS = 2,
-    VARIANT = "mutant_remat_broken"
-  ).*
-}
-
-module calc_graph_mutant_no_stampede {
-  import calc_graph(
-    REQS = Set(1, 2, 3),
-    INPUT = Map(1 -> 1, 2 -> 2, 3 -> 1),
-    RESULT = Map(1 -> 7, 2 -> 7),
-    MAX_ATTEMPTS = 2,
-    VARIANT = "mutant_no_stampede"
-  ).*
 }

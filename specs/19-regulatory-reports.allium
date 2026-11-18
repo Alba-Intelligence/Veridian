@@ -34,6 +34,10 @@
 --   - Generation is a calculation node (02): its calc_id covers the template
 --     hash and the hashes of the figures it reads.
 
+-- Split (D-070): this file holds templates, report generation and release;
+--   19b-export-and-submission the export, submission and the regulator's
+--   answer; 19c-report-validation validation findings and cell differences.
+
 use "./01-bitemporal-data.allium" as data
 use "./02-calculation-graph.allium" as graph
 use "./05-configuration-release.allium" as cfg
@@ -41,6 +45,9 @@ use "./06-batch-scheduling.allium" as batch
 use "./11-frtb-sa.allium" as frtb
 use "./12-web-front-end-and-batch-console.allium" as web
 use "./13-report-review-alerts-trends.allium" as review
+use "./13b-alerts.allium" as alerts
+use "./19b-export-and-submission.allium" as sub
+use "./19c-report-validation.allium" as val
 
 ------------------------------------------------------------
 -- Contracts
@@ -143,42 +150,6 @@ entity RegulatoryReport {
     }
 }
 
--- A validation rule that failed, with the cells it involves.
-entity ValidationFinding {
-    report: RegulatoryReport
-    rule_ref: String
-    blocking: Boolean
-    cells: String
-    description: String
-}
-
--- One cell that differs between a report and the one it supersedes.
-entity CellDifference {
-    report: RegulatoryReport
-    cell_ref: String
-    previous_value: Decimal?
-    new_value: Decimal?
-}
-
--- A person's export of a released report: who took the file and when.
-entity ReportExport {
-    report: RegulatoryReport
-    exported_by: data/User
-    exported_at: Timestamp
-    file_hash: String
-}
-
--- The submission made by a person through the regulator's channel.
-entity Submission {
-    report: RegulatoryReport
-    submitted_by: data/User
-    submitted_at: Timestamp
-    receipt_ref: String
-    outcome: pending | accepted | refused
-    outcome_at: Timestamp?
-    outcome_reason: String?
-}
-
 ------------------------------------------------------------
 -- Config
 ------------------------------------------------------------
@@ -257,7 +228,7 @@ rule CreateReport {
 rule RejectTemplateCurrencyMismatch {
     when: ReportGenerated(publication, template, perimeter, previous)
     requires: template.reporting_currency != perimeter.reporting_currency
-    ensures: review/Alert.created(
+    ensures: alerts/Alert.created(
         source: run_problem,
         subject_ref: template.template_code,
         description: "template currency differs from the perimeter's reporting currency",
@@ -266,45 +237,6 @@ rule RejectTemplateCurrencyMismatch {
         escalated: false,
         alert_state: raised
     )
-}
-
-rule ListDifferences {
-    when: report: RegulatoryReport.created
-    requires: report.supersedes != null
-    ensures:
-        for d in cell_differences(report, report.supersedes):
-            CellDifference.created(
-                report: report,
-                cell_ref: difference_cell(d),
-                previous_value: difference_previous(d),
-                new_value: difference_new(d)
-            )
-}
-
-rule ValidateReport {
-    when: report: RegulatoryReport.created
-    ensures:
-        for f in validation_findings(report):
-            ValidationFinding.created(
-                report: report,
-                rule_ref: finding_rule(f),
-                blocking: finding_blocking(f),
-                cells: finding_cells(f),
-                description: finding_description(f)
-            )
-        if has_blocking_findings(report):
-            report.state = failed_validation
-            review/Alert.created(
-                source: run_problem,
-                subject_ref: report.template.template_code,
-                description: "regulatory report failed the regulator's validation rules",
-                raised_at: now,
-                owner: report.publication.run.schedule.owner,
-                escalated: false,
-                alert_state: raised
-            )
-        else:
-            report.state = validated
 }
 
 -- Release follows the sign-off of the publication (13); a report that failed
@@ -325,98 +257,6 @@ rule SupersedePrevious {
     ensures: previous.state = superseded
 }
 
-rule ExportReport {
-    when: ReportExportRequested(user, report)
-    requires: report.state in {released, submitted, accepted, refused}
-    requires: data/permitted(user, "report.export", report.template.template_code)
-    requires: data/freshly_authenticated(user)
-    ensures: ReportExport.created(
-        report: report,
-        exported_by: user,
-        exported_at: now,
-        file_hash: report.file_hash
-    )
-}
-
--- The submission is recorded by the person who made it, against a report they
--- exported. The receipt reference is the regulator's own.
-rule RecordSubmission {
-    when: SubmissionRecorded(user, report, receipt_ref)
-    requires: report.state = released
-    requires: exists ReportExport{report: report, exported_by: user}
-    requires: data/permitted(user, "report.submit", report.template.template_code)
-    requires: data/freshly_authenticated(user)
-    ensures:
-        report.state = submitted
-        Submission.created(
-            report: report,
-            submitted_by: user,
-            submitted_at: now,
-            receipt_ref: receipt_ref,
-            outcome: pending
-        )
-}
-
-rule RecordAcceptance {
-    when: RegulatorAccepted(user, submission)
-    requires: submission.outcome = pending
-    requires: data/permitted(user, "report.submit", submission.report.template.template_code)
-    ensures:
-        submission.outcome = accepted
-        submission.outcome_at = now
-        submission.report.state = accepted
-}
-
--- A refusal is an alert and needs a corrected version: the regulator's reason
--- is kept, and the owner decides on a restatement (06).
-rule RecordRefusal {
-    when: RegulatorRefused(user, submission, reason)
-    requires: submission.outcome = pending
-    requires: data/permitted(user, "report.submit", submission.report.template.template_code)
-    ensures:
-        submission.outcome = refused
-        submission.outcome_at = now
-        submission.outcome_reason = reason
-        submission.report.state = refused
-        review/Alert.created(
-            source: run_problem,
-            subject_ref: submission.report.template.template_code,
-            description: "regulator refused the submission",
-            raised_at: now,
-            owner: submission.report.publication.run.schedule.owner,
-            escalated: false,
-            alert_state: raised
-        )
-}
-
-rule DeadlineApproaching {
-    when: report: RegulatoryReport.due_at - config.deadline_warning <= now
-    requires: report.state in {generated, failed_validation, validated, released}
-    ensures: review/Alert.created(
-        source: run_problem,
-        subject_ref: report.template.template_code,
-        description: "regulatory report not yet submitted near its deadline",
-        raised_at: now,
-        owner: report.publication.run.schedule.owner,
-        escalated: false,
-        alert_state: raised
-    )
-}
-
-rule DeadlineMissed {
-    when: report: RegulatoryReport.due_at <= now
-    requires: report.state in {generated, failed_validation, validated, released}
-    ensures: review/Alert.created(
-        source: run_problem,
-        subject_ref: report.template.template_code,
-        description: "regulatory report deadline missed",
-        raised_at: now,
-        owner: report.publication.run.schedule.owner,
-        escalated: false,
-        alert_state: raised
-    )
-}
-
 ------------------------------------------------------------
 -- Invariants
 ------------------------------------------------------------
@@ -430,11 +270,6 @@ invariant NoReleaseWithoutSignOff {
     for r in RegulatoryReports:
         r.state in {released, submitted, accepted, refused}
             implies exists review/ReportSignOff{publication: r.publication, signoff: signed_off}
-}
-
-invariant SubmissionNeedsExport {
-    for s in Submissions:
-        exists ReportExport{report: s.report, exported_by: s.submitted_by}
 }
 
 ------------------------------------------------------------
@@ -452,35 +287,6 @@ actor ReportWorker {
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
-
-surface RegulatoryReportHandling {
-    facing officer: ReportingOfficer
-    context report: RegulatoryReport
-
-    exposes:
-        report.template.regulator
-        report.template.template_code
-        report.template.taxonomy_version
-        report.perimeter.name
-        report.publication.run.as_of
-        report.version
-        report.supersedes
-        report.state
-        report.due_at
-        report.file_hash
-        findings_of(report)
-        differences_of(report)
-        submission_of(report)
-
-    provides:
-        ReportExportRequested(officer, report) when report.state in {released, submitted, accepted, refused}
-        SubmissionRecorded(officer, report, receipt_ref) when report.state = released
-        RegulatorAccepted(officer, submission) when submission_of(report).outcome = pending
-        RegulatorRefused(officer, submission, reason) when submission_of(report).outcome = pending
-
-    contracts:
-        demands web/WebFrontEnd
-}
 
 surface ReportGenerationComputation {
     facing worker: ReportWorker

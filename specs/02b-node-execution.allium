@@ -1,0 +1,324 @@
+-- allium: 3
+-- 02b-node-execution.allium
+
+-- Scope: How planned steps bind to calculation nodes and how nodes run:
+--   memo hits, stampede control, dispatch, retries, timeouts, rejection and
+--   ringfenced failure, and how a request ends (completed, failed, cancelled).
+--   Part of the calculation graph (02-calculation-graph).
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./02c-payload-retention.allium" as ret
+use "./02d-attempts-and-inspection.allium" as insp
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Binding a ready step to its node. Exactly one branch applies:
+--   complete node  -> memo hit, no computation
+--   irreproducible node -> the step is abandoned at once (D-062): the node can
+--                          no longer serve results, a recomputation cannot help
+--   purged payload -> recomputed once (D-062): the first step starts it and
+--                     marks the payload; later steps attach to it
+--   in-flight node -> stampede control: attach, no second computation
+--   failed node    -> failure is terminal for that calc_id
+--   no node        -> miss: exactly one new node is created
+-- Steps of a request that has already failed are not bound (they are cancelled).
+rule StepBindsToNode {
+    -- model: calc_graph.bindNew calc_graph.bindExisting
+    when: step: graph/PlannedStep.is_ready
+    requires: step.status = waiting
+    requires: step.request.status = open
+    let id = calc_id_of(step.model, step.request.as_of, step.inputs, prerequisite_result_hashes(step.prerequisites))
+    let existing = graph/CalculationNode{calc_id: id}
+    ensures:
+        if exists existing:
+            step.calc_id = id
+            step.node = existing
+            step.memo_hit = true
+            if existing.status = complete and not existing.reproducible:
+                step.status = abandoned
+            else if existing.status = complete and existing.payload?.tier = purged:
+                step.status = running
+                if not existing.payload.recomputing:
+                    existing.payload.recomputing = true
+                    existing.payload.recompute_attempts = 1
+                    RematerialisationRequested(payload: existing.payload)
+            else if existing.status = complete:
+                step.status = done
+            else if existing.status = failed:
+                step.status = abandoned
+            else:
+                step.status = running
+        else:
+            let node = graph/CalculationNode.created(
+                calc_id: id,
+                model: step.model,
+                as_of: step.request.as_of,
+                inputs: step.inputs,
+                prerequisite_nodes: prerequisite_nodes(step.prerequisites),
+                -- In a whatif request, a step that touches no whatif input
+                -- (directly or through prerequisites) is a production node:
+                -- calc_id ignores the class, so it is shared with production.
+                data_class: node_class_of(step),
+                created_at: now,
+                attempts: 0,
+                dispatched_at: null,
+                status: pending,
+                reproducible: true
+            )
+            step.status = running
+            step.calc_id = id
+            step.node = node
+            step.memo_hit = false
+}
+
+-- Dispatch to a worker (on creation and on each retry).
+rule DispatchNode {
+    -- model: calc_graph.dispatch
+    when: node: graph/CalculationNode.status becomes pending
+    requires: node.attempts < graph/config.max_attempts
+    ensures:
+        node.status = computing
+        node.attempts = node.attempts + 1
+        ComputationDispatched(node: node)
+}
+
+-- The compute timeout runs from the moment a worker takes the job, not from
+-- dispatch: time spent in the bounded queue (07) never counts against it.
+rule ComputationStartsOnWorker {
+    when: ComputationAssigned(node, worker, environment)
+    requires: node.status = computing
+    ensures:
+        node.dispatched_at = now
+        -- A requeued ticket (07) is assigned again: its earlier attempt ends.
+        for a in node.attempt_log:
+            if a.outcome = running:
+                a.outcome = crashed
+                a.ended_at = now
+                a.reason = "requeued"
+        insp/ComputationAttempt.created(
+            node: node,
+            sequence: node.attempt_log.count + 1,
+            purpose: computation,
+            worker: worker,
+            environment: environment,
+            started_at: now,
+            outcome: running
+        )
+}
+
+rule ComputationSucceeds {
+    -- model: calc_graph.succeed
+    when: ComputationSucceeded(worker, node, result_ref, result_hash)
+    requires: node.status = computing
+    ensures:
+        node.status = complete
+        node.result_hash = result_hash
+        node.completed_at = now
+        node.dispatched_at = null
+        for a in node.attempt_log:
+            if a.outcome = running:
+                a.outcome = succeeded
+                a.ended_at = now
+                a.result_hash = result_hash
+                node.computed_by = a
+        ret/ResultPayload.created(node: node, tier: hot, tier_since: now, result_ref: result_ref, recomputing: false, recompute_attempts: 0, recompute_started_at: null)
+}
+
+-- Infrastructure failure (crash, OOM kill, lost worker): retry while allowed.
+rule ComputationCrashes {
+    -- model: calc_graph.crash
+    when: ComputationCrashed(worker, node, reason, log_excerpt?)
+    requires: node.status = computing
+    ensures:
+        for a in node.attempt_log:
+            if a.outcome = running:
+                a.outcome = crashed
+                a.ended_at = now
+                a.reason = reason
+                a.log_excerpt = bounded(log_excerpt, insp/config.max_log_excerpt)
+        if node.attempts < graph/config.max_attempts:
+            node.status = pending
+            node.dispatched_at = null
+        else:
+            node.status = failed
+            node.failure_reason = reason
+            node.failed_at = now
+            node.dispatched_at = null
+}
+
+-- Deterministic rejection (invalid inputs, model error): retrying is futile.
+rule ComputationRejects {
+    -- model: calc_graph.reject
+    when: ComputationRejected(worker, node, reason, log_excerpt?)
+    requires: node.status = computing
+    ensures:
+        for a in node.attempt_log:
+            if a.outcome = running:
+                a.outcome = rejected
+                a.ended_at = now
+                a.reason = reason
+                a.log_excerpt = bounded(log_excerpt, insp/config.max_log_excerpt)
+        node.status = failed
+        node.failure_reason = reason
+        node.failed_at = now
+        node.dispatched_at = null
+}
+
+rule ComputationTimesOut {
+    -- model: calc_graph.crash
+    when: node: graph/CalculationNode.dispatched_at + graph/config.compute_timeout <= now
+    requires: node.status = computing
+    ensures:
+        ComputationCrashed(worker: null, node: node, reason: "timeout", log_excerpt: null)
+}
+
+rule StepCompletesWithNode {
+    -- model: calc_graph.stepDone
+    when: step: graph/PlannedStep.node_available
+    requires: step.status = running
+    requires: not step.node_failed
+    ensures: step.status = done
+}
+
+-- Ringfence: a failure reaches only the steps bound to that node.
+rule StepFailsWithNode {
+    -- model: calc_graph.stepAbandon
+    when: step: graph/PlannedStep.node_failed
+    requires: step.status = running
+    ensures: step.status = abandoned
+}
+
+-- Waiting steps that can no longer run are cancelled. Running siblings keep
+-- going: their nodes are shared and may serve other requests.
+rule StepCancelledWithRequest {
+    -- model: calc_graph.stepCancel
+    when: step: graph/PlannedStep.request_failed
+    requires: step.status = waiting
+    ensures: step.status = cancelled
+}
+
+rule RequestCompletes {
+    -- model: calc_graph.requestFulfil
+    when: request: graph/CalculationRequest.all_done
+    requires: request.status = open
+    requires: not request.any_abandoned
+    ensures:
+        request.status = fulfilled
+        request.completed_at = now
+}
+
+rule RequestFails {
+    -- model: calc_graph.requestFail
+    when: request: graph/CalculationRequest.any_abandoned
+    requires: request.status = open
+    ensures:
+        request.status = unfulfilled
+        request.completed_at = now
+        request.failure_reason = "calculation step abandoned"
+}
+
+-- Cancellation by the requester, or by a batch operator for a batch run
+-- (D-038). Waiting steps are cancelled; running nodes finish, since they are
+-- shared and may serve other requests.
+rule CancelRequest {
+    -- model: calc_graph.cancel
+    when: graph/RequestCancellationRequested(user, request)
+    requires: request.status = open
+    requires: user = request.requested_by
+        or data/permitted(user, "calc.cancel", request.origin_ref)
+    ensures:
+        request.status = unfulfilled
+        request.completed_at = now
+        request.failure_reason = "cancelled"
+}
+
+-- Up-front failure (D-008): an input with no version effective at as_of, as
+-- known at known_at, has no content hash, so no calc_id can exist. The planner
+-- reports it before any step or node is created.
+rule PlanningFails {
+    when: graph/PlanningFailed(request, reason)
+    requires: request.status = open
+    requires: not request.plan_expanded
+    ensures:
+        request.status = unfulfilled
+        request.completed_at = now
+        request.failure_reason = reason
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant OneNodePerCalcId {
+    -- model: calc_graph.oneNodePerCalcId
+    for a in graph/CalculationNodes:
+        for b in graph/CalculationNodes:
+            a != b implies a.calc_id != b.calc_id
+}
+
+-- Data classes never mix: no test or synthetic input reaches a production
+-- result, and vice versa. The one-way whatif exception (D-038): a whatif node
+-- may read production inputs and nodes; nothing else reads whatif. An impact
+-- node (24, D-067) is the same: it reads production, nothing reads it.
+invariant NodeInputsShareDataClass {
+    for n in graph/CalculationNodes:
+        n.inputs.all(v => v.series.data_class = n.data_class
+            or (n.data_class in {whatif, impact} and v.series.data_class = production))
+}
+
+invariant WhatifNeverLeaks {
+    for n in graph/CalculationNodes:
+        n.data_class not in {whatif, impact}
+            implies n.prerequisite_nodes.all(p => p.data_class not in {whatif, impact})
+}
+
+-- A production node's model came through a reviewed production release.
+invariant ProductionUsesReviewedModels {
+    for n in graph/CalculationNodes:
+        n.data_class = production implies released_for_production(n.model)
+}
+
+invariant AttemptsBounded {
+    -- model: calc_graph.attemptsBounded
+    for n in graph/CalculationNodes:
+        n.attempts <= graph/config.max_attempts
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The supervised Julia worker pool (04-julia-worker.allium).
+actor ComputeWorker {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface WorkerProtocol {
+    facing worker: ComputeWorker
+    context node: graph/CalculationNode where status = computing
+
+    exposes:
+        node.calc_id
+        node.model
+        node.as_of
+        node.inputs
+        node.prerequisite_nodes
+
+    provides:
+        ComputationSucceeded(worker, node, result_ref, result_hash)
+        ComputationCrashed(worker, node, reason, log_excerpt?)
+        ComputationRejected(worker, node, reason, log_excerpt?)
+
+    contracts:
+        demands DeterministicComputation
+
+    timeout:
+        ComputationTimesOut
+}

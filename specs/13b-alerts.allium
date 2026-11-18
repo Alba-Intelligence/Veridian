@@ -1,0 +1,218 @@
+-- allium: 3
+-- 13b-alerts.allium
+
+-- Scope: Alert rules defined in configuration, the alerts raised by figures,
+--   data problems, failed or late runs and missed deadlines, and their
+--   notification, acknowledgement, resolution and escalation. Part of 13.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./10-data-ingestion-and-synthetic.allium" as ingest
+use "./12-web-front-end-and-batch-console.allium" as web
+use "./13-report-review-alerts-trends.allium" as rev
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- An alert rule, defined in configuration and registered on release
+-- activation, like schedules (06) and perimeters (11).
+entity AlertRule {
+    name: String
+    definition_hash: String
+    release: cfg/ConfigurationRelease
+    owner: data/User
+    -- threshold: value beyond a limit; day_change: change from the previous
+    -- as_of beyond a percentage or amount; outlier: statistical outlier
+    -- against recent history; capital_move: change in capital beyond an
+    -- amount. Data and run problems are always alerts (no rule needed).
+    kind: threshold | day_change | outlier | capital_move
+    figure_pattern: String
+    parameters_hash: String
+}
+
+entity Alert {
+    source: rule_breach | data_problem | run_problem
+    rule: AlertRule?
+    figure: rev/ReportedFigure?
+    subject_ref: String
+    description: String
+    raised_at: Timestamp
+    owner: data/User
+    escalated: Boolean
+    acknowledged_by: data/User?
+    acknowledged_at: Timestamp?
+    resolved_note: String?
+    alert_state: raised | acknowledged | resolved
+
+    transitions alert_state {
+        raised -> acknowledged
+        raised -> resolved
+        acknowledged -> resolved
+        terminal: resolved
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Alert rules come only from configuration releases.
+rule RegisterReleaseAlertRules {
+    when: cfg/ReleaseActivated(release, previous)
+    ensures:
+        for d in release_alert_rules(release):
+            AlertRuleDefined(release: release, definition: d)
+}
+
+rule CreateAlertRule {
+    when: AlertRuleDefined(release, definition)
+    requires: not exists AlertRule{definition_hash: alert_definition_hash(definition)}
+    ensures: AlertRule.created(
+        name: alert_name(definition),
+        definition_hash: alert_definition_hash(definition),
+        release: release,
+        owner: alert_owner(definition),
+        kind: alert_kind(definition),
+        figure_pattern: alert_pattern(definition),
+        parameters_hash: alert_parameters_hash(definition)
+    )
+}
+
+-- Each new figure is checked against every matching rule of the active
+-- release; history comes from earlier ReportedFigures with the same key.
+rule CheckFigure {
+    when: figure: rev/ReportedFigure.created
+    ensures:
+        for r in alert_rules_matching(figure.figure_key):
+            if breaches(r, figure):
+                RuleBreached(rule: r, figure: figure)
+}
+
+rule RaiseRuleAlert {
+    when: RuleBreached(rule, figure)
+    requires: not exists Alert{rule: rule, figure: figure}
+    ensures: Alert.created(
+        source: rule_breach,
+        rule: rule,
+        figure: figure,
+        subject_ref: figure.figure_key,
+        description: breach_description(rule, figure),
+        raised_at: now,
+        owner: rule.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RaiseDataAlert {
+    when: ingest/DataQualityAlert(source, problem)
+    ensures: Alert.created(
+        source: data_problem,
+        subject_ref: source_ref(source),
+        description: problem,
+        raised_at: now,
+        owner: source_owner(source),
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RaiseRunFailureAlert {
+    when: batch/BatchRunFailed(run, owner)
+    ensures: Alert.created(
+        source: run_problem,
+        subject_ref: run.run_ref,
+        description: "batch run failed",
+        raised_at: now,
+        owner: owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RaiseDeadlineAlert {
+    when: batch/BatchDeadlineMissed(run, owner)
+    ensures: Alert.created(
+        source: run_problem,
+        subject_ref: run.run_ref,
+        description: "batch deadline missed",
+        raised_at: now,
+        owner: owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RaiseLateStartAlert {
+    when: batch/LateRunStarted(schedule, cutoff, owner)
+    ensures: Alert.created(
+        source: run_problem,
+        subject_ref: schedule.name,
+        description: "batch run started late",
+        raised_at: now,
+        owner: owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+-- Delivery: in the app and by email (D-038).
+rule NotifyAlert {
+    when: alert: Alert.created
+    ensures: AlertNotified(alert: alert, recipient: alert.owner, channels: {"in_app", "email"})
+}
+
+rule AcknowledgeAlert {
+    when: AlertAcknowledged(user, alert)
+    requires: alert.alert_state = raised
+    requires: data/permitted(user, "alert.acknowledge", alert.subject_ref)
+    ensures:
+        alert.alert_state = acknowledged
+        alert.acknowledged_by = user
+        alert.acknowledged_at = now
+}
+
+rule ResolveAlert {
+    when: AlertResolved(user, alert, note)
+    requires: alert.alert_state in {raised, acknowledged}
+    requires: data/permitted(user, "alert.resolve", alert.subject_ref)
+    ensures:
+        alert.alert_state = resolved
+        alert.resolved_note = note
+}
+
+rule EscalateUnacknowledgedAlert {
+    when: alert: Alert.raised_at + rev/config.alert_escalation_after <= now
+    requires: alert.alert_state = raised
+    requires: not alert.escalated
+    ensures:
+        alert.escalated = true
+        AlertEscalated(alert: alert, escalate_to: escalation_contact(alert.owner))
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface AlertInbox {
+    facing reviewer: rev/RiskReviewer
+    context alert: Alert where owner = reviewer
+
+    exposes:
+        alert.source
+        alert.subject_ref
+        alert.description
+        alert.raised_at
+        alert.alert_state
+        alert.escalated
+
+    provides:
+        AlertAcknowledged(reviewer, alert) when alert.alert_state = raised
+        AlertResolved(reviewer, alert, note) when alert.alert_state in {raised, acknowledged}
+
+    contracts:
+        demands web/WebFrontEnd
+}

@@ -1,0 +1,144 @@
+-- allium: 3
+-- 10b-golden-sets.allium
+
+-- Scope: Golden data sets: proposal, signature by validator and owner, and
+--   supersession. Part of 10.
+
+use "./01-bitemporal-data.allium" as data
+use "./05-configuration-release.allium" as cfg
+use "./10-data-ingestion-and-synthetic.allium" as ing
+use "./10c-synthetic-data.allium" as syn
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A golden data set with its expected results, before it may serve as a
+-- regression fixture (F-1, D-051). The content hash covers the inputs and the
+-- expected results together, so a changed set is a new record that needs new
+-- sign-off; nothing is edited in place.
+entity GoldenDataSet {
+    name: String
+    content_hash: String
+    author: data/User
+    data_owner: data/User
+    proposed_at: Timestamp
+    supersedes: GoldenDataSet?
+    validator: data/User? when state = partly_signed | signed_off
+    owner_signed_by: data/User? when state = partly_signed | signed_off
+    state: awaiting_signoff | partly_signed | signed_off | superseded
+
+    transitions state {
+        awaiting_signoff -> partly_signed
+        awaiting_signoff -> signed_off
+        partly_signed -> signed_off
+        awaiting_signoff -> superseded
+        partly_signed -> superseded
+        signed_off -> superseded
+        terminal: superseded
+    }
+
+    invariant SignersAreIndependent {
+        state = signed_off implies
+            validator != author and owner_signed_by != author and validator != owner_signed_by
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Golden sets (D-051): two different people sign off, neither the author. The
+-- model validator (21, permission model.validate) confirms the expected
+-- results against the independent reference; the data owner confirms the
+-- inputs. Sign-off is recorded against the content hash.
+rule ProposeGoldenSet {
+    when: GoldenSetProposed(author, name, content_hash, data_owner, supersedes?)
+    requires: data/permitted(author, "golden.propose", name)
+    requires: data_owner != author
+    requires: not exists GoldenDataSet{content_hash: content_hash}
+    ensures: GoldenDataSet.created(
+        name: name,
+        content_hash: content_hash,
+        author: author,
+        data_owner: data_owner,
+        proposed_at: now,
+        supersedes: supersedes,
+        state: awaiting_signoff
+    )
+}
+
+rule SignGoldenAsValidator {
+    when: GoldenSetValidated(validator, set)
+    requires: set.state in {awaiting_signoff, partly_signed}
+    requires: set.validator = null
+    requires: validator != set.author and validator != set.data_owner
+    requires: data/permitted(validator, "model.validate", set.name)
+    requires: data/freshly_authenticated(validator)
+    ensures:
+        set.validator = validator
+        if set.owner_signed_by != null:
+            set.state = signed_off
+        else:
+            set.state = partly_signed
+}
+
+rule SignGoldenAsOwner {
+    when: GoldenSetConfirmed(owner, set)
+    requires: set.state in {awaiting_signoff, partly_signed}
+    requires: set.owner_signed_by = null
+    requires: owner = set.data_owner
+    requires: owner != set.author
+    requires: data/permitted(owner, "golden.confirm_data", set.name)
+    requires: data/freshly_authenticated(owner)
+    ensures:
+        set.owner_signed_by = owner
+        if set.validator != null:
+            set.state = signed_off
+        else:
+            set.state = partly_signed
+}
+
+-- A new version of a golden set replaces the one it names; fixtures always
+-- point at a set in state signed_off.
+rule SupersedeGoldenSet {
+    when: set: GoldenDataSet.state becomes signed_off
+    requires: set.supersedes != null
+    ensures: set.supersedes.state = superseded
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor GoldenSetReviewer {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface GoldenSetSignOff {
+    facing reviewer: GoldenSetReviewer
+    context set: GoldenDataSet
+
+    exposes:
+        set.name
+        set.content_hash
+        set.author
+        set.data_owner
+        set.validator
+        set.owner_signed_by
+        set.state
+
+    provides:
+        GoldenSetProposed(reviewer, name, content_hash, data_owner, supersedes?)
+        GoldenSetValidated(reviewer, set) when set.state in {awaiting_signoff, partly_signed}
+        GoldenSetConfirmed(reviewer, set) when set.state in {awaiting_signoff, partly_signed}
+
+    @guarantee FixturesUseSignedOffSets
+        -- A regression fixture (F-1) names a golden set only in state
+        -- signed_off; a fixture whose set has been superseded fails until it
+        -- points at the new one.
+}

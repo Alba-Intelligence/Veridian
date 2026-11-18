@@ -1,0 +1,234 @@
+-- allium: 3
+-- 25b-stress-runs.allium
+
+-- Scope: Applying an approved scenario version to a perimeter: scheduled stress
+--   runs in the batch, ad-hoc runs by users, results and reported figures
+--   (D-068, part of the scenario design in 25).
+-- Excludes: the register and its approval (25); how a shock is applied and a
+--   position revalued (a Julia model in a release, 07, 08, 09, 17, 18).
+-- Dependencies: 01, 02, 06, 13, 23, 25.
+--
+-- The stress is a CalculationRequest of data class production that pins the
+-- version's definition input (25) besides the perimeter's positions, so a
+-- scenario node differs from the base node through its input hashes (02) and
+-- is memoized. Scheduled runs are
+-- durable and part of a batch run; ad-hoc runs are ephemeral (23) and
+-- unofficial (14); a durable run adopts an ad-hoc node with the same calc_id.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./06-batch-scheduling.allium" as batch
+use "./13-report-review-alerts-trends.allium" as report
+use "./25-governed-scenarios.allium" as reg
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- One request to apply a version to a perimeter.
+entity StressRun {
+    version: reg/ScenarioVersion
+    perimeter: String
+    as_of: Timestamp
+    known_at: Timestamp
+    requested_by: data/User
+    purpose: scheduled | adhoc
+    batch_run: batch/BatchRun? when purpose = scheduled
+    request: graph/CalculationRequest
+    status: running | completed | failed
+
+    transitions status {
+        running -> completed
+        running -> failed
+        terminal: completed, failed
+    }
+
+    results: ScenarioResult with stress_run = this
+}
+
+entity ScenarioResult {
+    stress_run: StressRun
+    scenario_name: String
+    -- Any level of the hierarchy: book, desk, entity, perimeter.
+    node_ref: String
+    base_value: Decimal
+    stressed_value: Decimal
+    pnl: Decimal
+    currency: String
+    source_calc_id: String
+}
+
+------------------------------------------------------------
+-- Rules: runs
+------------------------------------------------------------
+
+-- Scheduled: with each completed batch run, every scheduled approved version
+-- is applied to the perimeters of the run's schedule. A durable request (23).
+rule StartScheduledStress {
+    -- model: scenario_register.startRun
+    when: run: batch/BatchRun.status becomes completed
+    requires: run.rerun_mode in {original, restate}
+    ensures:
+        for v in reg/ScenarioVersions where status = approved and scheduled:
+            for p in schedule_perimeters(run.schedule):
+                StressRun.created(
+                    version: v,
+                    perimeter: p,
+                    as_of: run.as_of,
+                    known_at: run.cutoff,
+                    requested_by: platform_service(),
+                    purpose: scheduled,
+                    batch_run: run,
+                    request: stress_request(v, p, run.as_of, run.cutoff, platform_service(), batch_ref(run)),
+                    status: running
+                )
+}
+
+-- Ad hoc: any approved version, on a perimeter the user may see. Results are
+-- unofficial and ephemeral; the same work already done by a batch run is a
+-- memo hit.
+rule RequestAdhocStress {
+    -- model: scenario_register.startRun
+    when: StressRequested(user, version, perimeter, as_of)
+    requires: version.status = approved
+    requires: data/permitted(user, "scenario.run", perimeter)
+    ensures: StressRun.created(
+        version: version,
+        perimeter: perimeter,
+        as_of: as_of,
+        known_at: now,
+        requested_by: user,
+        purpose: adhoc,
+        request: stress_request(version, perimeter, as_of, now, user, adhoc_ref(user, version)),
+        status: running
+    )
+}
+
+rule StressCompletes {
+    -- model: scenario_register.startRun
+    when: s: StressRun.request.status transitions_to fulfilled
+    requires: s.status = running
+    ensures:
+        s.status = completed
+        for r in stress_results(s):
+            ScenarioResult.created(
+                stress_run: s,
+                scenario_name: r.scenario_name,
+                node_ref: r.node_ref,
+                base_value: r.base_value,
+                stressed_value: r.stressed_value,
+                pnl: r.stressed_value - r.base_value,
+                currency: r.currency,
+                source_calc_id: r.source_calc_id
+            )
+}
+
+rule StressFails {
+    when: s: StressRun.request.status transitions_to unfulfilled
+    requires: s.status = running
+    ensures: s.status = failed
+}
+
+-- A scheduled stress result is a reported figure of the batch run, retained
+-- like the others (13). Ad-hoc results are not. The publication does not wait
+-- for the stress runs, so the figures are recorded when the later of the two
+-- happens.
+rule RecordStressFigures {
+    when: s: StressRun.status becomes completed
+    requires: s.purpose = scheduled
+    let pub = s.batch_run.publication
+    requires: exists pub
+    ensures: StressFiguresRecorded(stress_run: s, publication: pub)
+}
+
+rule RecordStressFiguresAtPublication {
+    when: pub: batch/RunPublication.created
+    ensures:
+        for s in StressRuns where purpose = scheduled and status = completed and batch_run = pub.run:
+            StressFiguresRecorded(stress_run: s, publication: pub)
+}
+
+rule WriteStressFigures {
+    when: StressFiguresRecorded(stress_run, publication)
+    ensures:
+        for r in stress_run.results:
+            report/ReportedFigure.created(
+                publication: publication,
+                figure_key: stress_run.perimeter + "/stress/" + stress_run.version.scenario_set.name
+                    + "/v" + stress_run.version.number + "/" + r.scenario_name + "/" + r.node_ref,
+                as_of: stress_run.as_of,
+                value: r.pnl,
+                currency: r.currency,
+                data_class: production,
+                source_calc_id: r.source_calc_id,
+                recorded_at: now,
+                retained_until: figure_retention(publication)
+            )
+}
+
+-- What a run used is an approved version, and it is the version the run says:
+-- content never changes after approval (the register has no edit rule for a
+-- version past draft).
+invariant RunsUseApprovedVersions {
+    -- model: scenario_register.runsOnlyApproved
+    for s in StressRuns:
+        s.version.status in {approved, retired}
+}
+
+-- A scenario node belongs to one version: the request pins its definition.
+invariant StressReadsDefinition {
+    for s in StressRuns:
+        s.request.pinned_inputs.contains(s.version.definition_input)
+}
+
+actor RiskUser {
+    identified_by: data/User
+}
+
+surface StressResults {
+    facing user: RiskUser
+    context run: StressRun where requested_by = user or purpose = scheduled
+
+    exposes:
+        run.version.scenario_set.name
+        run.version.number
+        run.perimeter
+        run.status
+        run.purpose
+        for r in run.results:
+            r.scenario_name
+            r.node_ref
+            r.base_value
+            r.stressed_value
+            r.pnl
+            r.currency
+        -- Ad-hoc results carry the mark "unofficial" with as_of and known_at (14).
+
+    provides:
+        StressRequested(user, version, perimeter, as_of) when version.status = approved
+}
+
+
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black boxes owned by Elixir:
+--   schedule_perimeters(schedule), batch_ref(run), adhoc_ref(user, version),
+--   platform_service(), figure_retention(publication): as in 06, 13.
+--   stress_request(version, perimeter, as_of, known_at, requester, origin_ref):
+--     a CalculationRequest (02) of data class production whose subjects are
+--     the perimeter's positions and pinned_inputs is the version's definition
+--     input; origin_ref names a batch run for a
+--     scheduled request, a stress for an ad-hoc one (23: ephemeral).
+--   stress_results(run): per scenario and hierarchy node, base and stressed
+--     values in the reporting currency, read from the fulfilled request.
+-- The shock itself is applied by a Julia model of the release (08), reading
+-- production inputs only and the version's definition, never the register.
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- Resolved (D-068): the release impact gate does not replay stress runs. A restatement is stressed again, its figures attach to the new publication and the replaced publication keeps its own.
+open question "Stress figures arrive after the publication is signed off (13). Do late figures need their own sign-off, or are they supplementary to the signed publication?"

@@ -1,0 +1,284 @@
+-- allium: 3
+-- 07b-compute-hosts.allium
+
+-- Scope: The hosts that run Julia workers: the supply contract and the host
+--   lifecycle (joining, serving, retiring, heartbeat, loss). Part of the Julia
+--   worker spec (07-julia-workers); see its header for the principles.
+-- Dependencies: 01, 02, 05, 06, 07.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./07-julia-workers.allium" as core
+use "./07d-job-dispatch.allium" as disp
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract HostSupply {
+    submit_allocation: (reason: String, max_workers: Integer) -> String
+    release_allocation: (scheduler_ref: String) -> Boolean
+
+    @invariant SchedulerSuppliesHostsOnly
+        -- The grid scheduler (Slurm) receives requests for long-running host
+        -- allocations, never individual calculations. Account, partition,
+        -- quality of service and walltime are configuration artefacts (D-027).
+
+    @invariant EodPeakCapacity
+        -- Regulatory EOD runs ask for their peak as one batch of hosts (a
+        -- Slurm job array) under a higher quality of service; other demand
+        -- asks for one host at a time (D-039).
+
+    @invariant EodArrayBeforeCutoff
+        -- The array is requested config.capacity_lead (06) before the run's
+        -- cut-off, so the grid's wait is not part of the run's deadline
+        -- (D-045). Preempting running hosts is the fallback, not the plan:
+        -- in the spike it took the scheduler 11-34 s to act.
+
+    @invariant EvictionOnFirstSignal
+        -- A host told to stop (preemption or walltime warning) stops taking
+        -- jobs on the first signal and does not rely on the scheduler's grace
+        -- period: in the spike the preempting job started on the node before
+        -- the victim had drained, and the walltime warning came earlier than
+        -- asked (D-045).
+
+    @invariant LivenessFromHeartbeat
+        -- model: bundled_dispatch.receive
+        -- Whether a host is alive is decided by the control plane's own
+        -- heartbeat (config.heartbeat_timeout), never by the scheduler's job
+        -- or node state, which lagged 47-49 s behind a frozen host in the
+        -- spike (D-037, D-045). A scheduler report that a job ended is
+        -- accepted at once as HostDown. Results reported after a host was
+        -- declared lost are ignored: its tickets are already finished.
+
+    @invariant NetworkPath
+        -- Grid hosts join over Erlang distribution with TLS on fixed ports;
+        -- where the bank's firewall forbids inbound connections to grid
+        -- nodes, an outbound-only host agent is used instead (D-039).
+
+    @invariant SameCodePathEverywhere
+        -- A developer laptop runs the same allocation flow against a
+        -- simulated Slurm cluster (several simulated nodes, defined as code in
+        -- the development environment); production differs only in
+        -- configuration.
+
+    @invariant FailureInjection
+        -- The simulation can reproduce refusal, long queueing, cancellation,
+        -- preemption, walltime expiry and node loss, so the rules below are
+        -- tested end to end.
+
+    @invariant DataClassOnRentedCloud
+        -- Later, cheap cloud Slurm (spot or preemptible machines) is a
+        -- supplier like any other; it serves only the data classes its
+        -- configuration approves (synthetic and test by default, D-037).
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A request to the grid scheduler for one host, or for a batch of hosts (a job
+-- array, array_size > 1) for a regulatory run (D-037, D-045). Released when
+-- every host it carries has left.
+entity HostAllocation {
+    reason: String
+    requested_at: Timestamp
+    state: submitted | granted | released | refused
+    scheduler_ref: String?
+    walltime_ends_at: Timestamp?
+    ended_at: Timestamp?
+    slow_alerted: Boolean
+    array_size: Integer
+    -- When the hosts must be serving (the run's cut-off); null for single hosts.
+    needed_by: Timestamp?
+    late_alerted: Boolean
+    hosts: ComputeHost with allocation = this
+    live_hosts: hosts where presence != gone
+    serving_now: hosts where presence = serving
+
+    transitions state {
+        submitted -> granted
+        submitted -> refused
+        granted -> released
+        terminal: released, refused
+    }
+}
+
+-- A BEAM node in the Veridian cluster that hosts Julia worker processes
+-- (D-030). Elasticity = hosts joining and retiring; each host grows or
+-- shrinks its own worker pool up to max_workers. A host from the grid
+-- carries its allocation and must have left before the walltime ends.
+entity ComputeHost {
+    node_name: String
+    max_workers: Integer
+    joined_at: Timestamp
+    -- The control plane's own liveness signal (D-045).
+    last_heartbeat: Timestamp
+    allocation: HostAllocation?
+    walltime_ends_at: Timestamp?
+    presence: joining | serving | retiring | gone
+    left_at: Timestamp when presence = gone
+
+    transitions presence {
+        joining -> serving
+        serving -> retiring
+        serving -> gone
+        retiring -> gone
+        joining -> gone
+        terminal: gone
+    }
+
+    workers: core/WorkerProcess with host = this
+    live_workers: workers where lifecycle in {starting, idle, busy, draining}
+    is_empty: live_workers.count = 0
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule HostJoins {
+    when: HostJoined(supervisor, node_name, max_workers)
+    requires: data/permitted(supervisor, "cluster.join", node_name)
+    requires: not exists ComputeHost{node_name: node_name, presence: serving}
+    ensures: ComputeHost.created(
+        node_name: node_name,
+        max_workers: max_workers,
+        joined_at: now,
+        last_heartbeat: now,
+        presence: joining
+    )
+}
+
+-- A host started inside a granted grid allocation.
+rule AllocatedHostJoins {
+    when: AllocatedHostJoined(supervisor, node_name, max_workers, allocation)
+    requires: data/permitted(supervisor, "cluster.join", node_name)
+    requires: allocation.state = granted
+    requires: not exists ComputeHost{node_name: node_name, presence: serving}
+    requires: allocation.hosts.count < allocation.array_size
+    ensures: ComputeHost.created(
+        node_name: node_name,
+        max_workers: max_workers,
+        joined_at: now,
+        last_heartbeat: now,
+        allocation: allocation,
+        walltime_ends_at: allocation.walltime_ends_at,
+        presence: joining
+    )
+}
+
+rule HostStartsServing {
+    when: HostReady(supervisor, host)
+    requires: host.presence = joining
+    ensures: host.presence = serving
+}
+
+-- Scale down: the host takes no new jobs, finishes running ones, then leaves.
+rule HostRetires {
+    when: HostRetirementRequested(supervisor, host)
+    requires: host.presence = serving
+    ensures:
+        host.presence = retiring
+        for w in host.live_workers:
+            WorkerDrainRequested(worker: w)
+}
+
+-- Walltime: a grid host stops taking jobs early enough to finish running
+-- ones before the scheduler ends the allocation. Slurm preemption with a
+-- grace period arrives as HostRetirementRequested; a hard kill as HostDown.
+rule WalltimeApproaching {
+    when: host: ComputeHost.walltime_ends_at - core/config.walltime_drain_margin <= now
+    requires: host.presence = serving
+    ensures:
+        host.presence = retiring
+        for w in host.live_workers:
+            WorkerDrainRequested(worker: w)
+}
+
+rule RetiredHostLeaves {
+    when: host: ComputeHost.is_empty
+    requires: host.presence = retiring
+    ensures:
+        host.presence = gone
+        host.left_at = now
+}
+
+-- The host's supervisor reports it alive every config.heartbeat_interval.
+rule HostHeartbeatReceived {
+    when: HostHeartbeat(supervisor, host)
+    requires: host.presence in {joining, serving, retiring}
+    ensures: host.last_heartbeat = now
+}
+
+-- The control plane declares a silent host lost itself (D-045): the grid's
+-- own view is slower and is only a hint.
+rule HostSilent {
+    -- model: bundled_dispatch.declareLost
+    when: host: ComputeHost.last_heartbeat + core/config.heartbeat_timeout <= now
+    requires: host.presence in {joining, serving, retiring}
+    ensures: HostLostDeclared(host: host, reason: "heartbeat lost")
+}
+
+-- The grid reports the host's job ended (killed, preempted, node down).
+rule HostDownReported {
+    when: HostDown(supervisor, host)
+    requires: host.presence in {joining, serving, retiring}
+    ensures: HostLostDeclared(host: host, reason: "host down reported")
+}
+
+-- Host crash or network partition: every job on it is treated as crashed
+-- (the graph retries elsewhere, node by node); nothing outside that host is
+-- affected.
+rule HostLost {
+    -- model: bundled_dispatch.declareLost
+    when: HostLostDeclared(host, reason)
+    requires: host.presence in {joining, serving, retiring}
+    ensures:
+        host.presence = gone
+        host.left_at = now
+        for w in host.live_workers:
+            disp/WorkerGone(worker: w, reason: reason)
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor WorkerSupervisor {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface Supervision {
+    facing supervisor: WorkerSupervisor
+    context worker: core/WorkerProcess
+
+    exposes:
+        worker.worker_ref
+        worker.lifecycle
+        worker.jobs_done
+
+    provides:
+        WorkerSpawned(supervisor, worker_ref, host, build, identity)
+        HostJoined(supervisor, node_name, max_workers)
+        AllocatedHostJoined(supervisor, node_name, max_workers, allocation)
+        AllocationStarted(supervisor, allocation, scheduler_ref, walltime_ends_at)
+        AllocationDenied(supervisor, allocation, reason)
+        HostReady(supervisor, host)
+        HostHeartbeat(supervisor, host)
+        HostRetirementRequested(supervisor, host)
+        HostDown(supervisor, host)
+        QueuePressureObserved(supervisor, queued, capacity)
+        IdleCapacityObserved(supervisor, host)
+        disp/WorkerExited(supervisor, worker, reason)
+        WorkerOverMemory(supervisor, worker, rss_mb)
+
+    contracts:
+        demands HostSupply
+}

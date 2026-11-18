@@ -28,21 +28,18 @@
 --   - A platform change is a release like any other: authored, approved by
 --     a different person, with evidence. Production and approval stay apart.
 
+-- Split (D-070): this file holds recovery, incidents and the actors;
+--   20b-platform-releases the rollout of platform releases and emergency
+--   changes; 20c-restore-and-storage restore drills and storage watch.
+
 use "./01-bitemporal-data.allium" as data
 use "./02-calculation-graph.allium" as graph
 use "./06-batch-scheduling.allium" as batch
 use "./07-julia-workers.allium" as workers
 use "./13-report-review-alerts-trends.allium" as review
-
-------------------------------------------------------------
--- Enumerations
-------------------------------------------------------------
-
--- control_plane: Elixir application code. schema: the ledger and object
--- store layout. worker_build: a Julia system image and manifest (07).
-enum PlatformReleaseKind { control_plane | schema | worker_build }
-
-enum StoreKind { ledger | payloads | audit | figures | reports }
+use "./13b-alerts.allium" as alerts
+use "./20b-platform-releases.allium" as rel
+use "./20c-restore-and-storage.allium" as store
 
 ------------------------------------------------------------
 -- Contracts
@@ -91,39 +88,6 @@ contract ProductionReadiness {
 -- Entities and Variants
 ------------------------------------------------------------
 
--- A release of the platform itself. Not a configuration release (05).
-entity PlatformRelease {
-    tag: String
-    kind: PlatformReleaseKind
-    submitted_by: data/User
-    submitted_at: Timestamp
-    -- A schema change is only accepted when the previous code keeps working
-    -- with it (add first, remove in a later release).
-    compatible_with_previous: Boolean
-    -- An emergency change may start inside the freeze window.
-    emergency: Boolean
-    approved_by: data/User?
-    review_needed: Boolean
-    reviewed_by: data/User?
-    refusal_reason: String?
-    status: submitted | approved | rolling_out | active | rolled_back | superseded | refused
-
-    transitions status {
-        submitted -> approved
-        submitted -> refused
-        approved -> rolling_out
-        rolling_out -> active
-        rolling_out -> rolled_back
-        active -> rolled_back
-        active -> superseded
-        terminal: rolled_back, superseded, refused
-    }
-
-    invariant ApproverIsNotAuthor {
-        approved_by != null implies approved_by != submitted_by
-    }
-}
-
 -- A failover or a restore from backup. Declared by an operator, closed when
 -- the platform serves again, reviewed afterwards by someone else.
 entity PlatformIncident {
@@ -146,26 +110,6 @@ entity PlatformIncident {
     }
 }
 
--- A rehearsal of recovery in an environment that is not production.
-entity RestoreDrill {
-    performed_by: data/User
-    performed_at: Timestamp
-    took: Duration
-    data_loss: Duration
-    objectives_met: Boolean
-    evidence_ref: String
-    reviewed_by: data/User?
-}
-
--- One reading of how full a store is and how fast it grows.
-entity StorageMeasurement {
-    store: StoreKind
-    used_bytes: Integer
-    capacity_bytes: Integer
-    daily_growth_bytes: Integer
-    measured_at: Timestamp
-}
-
 ------------------------------------------------------------
 -- Config
 ------------------------------------------------------------
@@ -185,127 +129,6 @@ config {
 ------------------------------------------------------------
 -- Rules
 ------------------------------------------------------------
-
--- Platform releases
-
-rule ReceivePlatformRelease {
-    when: PlatformReleaseSubmitted(submitter, tag, kind, compatible_with_previous, emergency)
-    requires: data/permitted(submitter, "platform.submit", kind)
-    requires: not exists PlatformRelease{tag: tag}
-    ensures: PlatformRelease.created(
-        tag: tag,
-        kind: kind,
-        submitted_by: submitter,
-        submitted_at: now,
-        compatible_with_previous: compatible_with_previous,
-        emergency: emergency,
-        review_needed: false,
-        status: submitted
-    )
-}
-
--- A schema change that the previous code cannot run against is refused: a
--- rolling restart needs old and new code to share one schema for a while.
-rule RefuseIncompatibleSchema {
-    when: release: PlatformRelease.created
-    requires: release.kind = schema
-    requires: not release.compatible_with_previous
-    ensures:
-        release.status = refused
-        release.refusal_reason = "schema change is not compatible with the running code; release it in two steps"
-}
-
-rule ApprovePlatformRelease {
-    when: PlatformReleaseApproved(approver, release)
-    requires: release.status = submitted
-    requires: approver != release.submitted_by
-    requires: data/permitted(approver, "platform.approve", release.kind)
-    requires: data/freshly_authenticated(approver)
-    ensures:
-        release.status = approved
-        release.approved_by = approver
-}
-
--- Outside the freeze window any approved release may start; inside it only an
--- emergency one, and then the runs in progress are flagged for review (06)
--- and the change itself must be reviewed by a third pair of eyes.
-rule StartRollout {
-    when: PlatformRolloutStarted(operator, release)
-    requires: release.status = approved
-    requires: data/permitted(operator, "platform.rollout", release.kind)
-    requires: not run_window_open(now) or release.emergency
-    ensures:
-        release.status = rolling_out
-        if run_window_open(now):
-            release.review_needed = true
-            for r in running_runs(now):
-                r.review_flag = true
-                r.review_reason = "platform release during the run"
-            EmergencyChangeStarted(release: release, owner: platform_owner())
-}
-
-rule FinishRollout {
-    when: PlatformRolloutFinished(operator, release)
-    requires: release.status = rolling_out
-    requires: data/permitted(operator, "platform.rollout", release.kind)
-    ensures:
-        release.status = active
-        PlatformReleaseActivated(release: release, previous: active_platform_release(release.kind))
-}
-
--- Exactly one active release per kind; activation and supersession share one
--- instant, as for configuration releases (05).
-rule SupersedePreviousPlatformRelease {
-    when: PlatformReleaseActivated(release, previous)
-    requires: previous != null
-    requires: previous.status = active
-    requires: previous != release
-    ensures: previous.status = superseded
-}
-
-rule RollBackRollout {
-    when: PlatformRolloutRolledBack(operator, release, reason)
-    requires: release.status in {rolling_out, active}
-    requires: data/permitted(operator, "platform.rollout", release.kind)
-    ensures:
-        release.status = rolled_back
-        release.refusal_reason = reason
-        review/Alert.created(
-            source: run_problem,
-            subject_ref: release.tag,
-            description: "platform release rolled back",
-            raised_at: now,
-            owner: platform_owner(),
-            escalated: false,
-            alert_state: raised
-        )
-}
-
-rule ReviewEmergencyChange {
-    when: EmergencyChangeReviewed(reviewer, release)
-    requires: release.review_needed
-    requires: release.reviewed_by = null
-    requires: reviewer != release.submitted_by and reviewer != release.approved_by
-    requires: data/permitted(reviewer, "platform.review", release.kind)
-    ensures: release.reviewed_by = reviewer
-}
-
-rule EmergencyReviewOverdue {
-    when: release: PlatformRelease.submitted_at + config.emergency_review_due <= now
-    requires: release.review_needed
-    requires: release.reviewed_by = null
-    ensures: review/Alert.created(
-        source: run_problem,
-        subject_ref: release.tag,
-        description: "emergency platform change not reviewed in time",
-        raised_at: now,
-        owner: platform_owner(),
-        escalated: false,
-        alert_state: raised
-    )
-}
-
--- Failover, restore and recovery
 
 rule DeclareIncident {
     when: IncidentDeclared(operator, kind)
@@ -336,7 +159,7 @@ rule RecordRecovery {
             incident.declared_at - recovered_to <= config.recovery_point_objective
                 and now - incident.declared_at <= config.recovery_time_objective
         if not incident.objectives_met:
-            review/Alert.created(
+            alerts/Alert.created(
                 source: run_problem,
                 subject_ref: "platform recovery",
                 description: "recovery objectives missed",
@@ -370,86 +193,6 @@ rule ReviewIncident {
         incident.reviewed_by = reviewer
 }
 
--- Drills prove that the objectives can be met, not just that backups exist.
-rule RecordRestoreDrill {
-    when: RestoreDrillRecorded(operator, took, data_loss, evidence_ref)
-    requires: data/permitted(operator, "platform.drill", "restore")
-    ensures:
-        RestoreDrill.created(
-            performed_by: operator,
-            performed_at: now,
-            took: took,
-            data_loss: data_loss,
-            objectives_met: data_loss <= config.recovery_point_objective
-                and took <= config.recovery_time_objective,
-            evidence_ref: evidence_ref
-        )
-}
-
--- Fires for the newest drill once the interval has passed. Before the first
--- drill there is nothing to fire on, which is why go-live itself requires one
--- (ProductionReadiness).
-rule RestoreDrillDue {
-    when: drill: RestoreDrill.performed_at + config.restore_drill_interval <= now
-    requires: drill = newest_restore_drill()
-    ensures: review/Alert.created(
-        source: run_problem,
-        subject_ref: "restore drill",
-        description: "no restore drill within the agreed interval",
-        raised_at: now,
-        owner: platform_owner(),
-        escalated: false,
-        alert_state: raised
-    )
-}
-
--- Storage
-
-rule RecordStorage {
-    when: StorageMeasured(collector, store, used_bytes, capacity_bytes, daily_growth_bytes)
-    requires: data/permitted(collector, "platform.measure", store)
-    ensures: StorageMeasurement.created(
-        store: store,
-        used_bytes: used_bytes,
-        capacity_bytes: capacity_bytes,
-        daily_growth_bytes: daily_growth_bytes,
-        measured_at: now
-    )
-}
-
--- Either already too full, or on its present growth too full within the
--- forecast horizon. Retention (13, 02) is configuration the bank can tighten,
--- but the platform never purges what a retention class still requires.
-rule StorageRunningOut {
-    when: m: StorageMeasurement.created
-    requires: m.used_bytes >= m.capacity_bytes * config.storage_warning_fraction
-        or m.used_bytes + m.daily_growth_bytes * config.storage_forecast_horizon.days >= m.capacity_bytes
-    ensures: review/Alert.created(
-        source: run_problem,
-        subject_ref: m.store,
-        description: "store is filling up",
-        raised_at: now,
-        owner: platform_owner(),
-        escalated: false,
-        alert_state: raised
-    )
-}
-
-------------------------------------------------------------
--- Invariants
-------------------------------------------------------------
-
-invariant EmergencyChangesAreReviewed {
-    for r in PlatformReleases:
-        r.review_needed and r.reviewed_by != null
-            implies r.reviewed_by != r.submitted_by and r.reviewed_by != r.approved_by
-}
-
-invariant RolloutNeedsApproval {
-    for r in PlatformReleases:
-        r.status in {rolling_out, active, superseded} implies r.approved_by != null
-}
-
 ------------------------------------------------------------
 -- Actor Declarations
 ------------------------------------------------------------
@@ -465,30 +208,6 @@ actor PlatformService {
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
-
-surface PlatformReleases {
-    facing operator: PlatformOperator
-    context release: PlatformRelease
-
-    exposes:
-        release.tag
-        release.kind
-        release.status
-        release.submitted_by
-        release.approved_by
-        release.emergency
-        release.review_needed
-        release.reviewed_by
-        release.compatible_with_previous
-
-    provides:
-        PlatformReleaseSubmitted(operator, tag, kind, compatible_with_previous, emergency)
-        PlatformReleaseApproved(operator, release) when release.status = submitted
-        PlatformRolloutStarted(operator, release) when release.status = approved
-        PlatformRolloutFinished(operator, release) when release.status = rolling_out
-        PlatformRolloutRolledBack(operator, release, reason) when release.status in {rolling_out, active}
-        EmergencyChangeReviewed(operator, release) when release.review_needed and release.reviewed_by = null
-}
 
 surface PlatformRecovery {
     facing operator: PlatformOperator
@@ -514,21 +233,6 @@ surface PlatformRecovery {
     contracts:
         demands RunRecovery
         demands ProductionReadiness
-}
-
-surface StorageWatch {
-    facing collector: PlatformService
-    context measurement: StorageMeasurement
-
-    exposes:
-        measurement.store
-        measurement.used_bytes
-        measurement.capacity_bytes
-        measurement.daily_growth_bytes
-        measurement.measured_at
-
-    provides:
-        StorageMeasured(collector, store, used_bytes, capacity_bytes, daily_growth_bytes)
 }
 
 ------------------------------------------------------------

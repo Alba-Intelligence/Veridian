@@ -85,17 +85,52 @@ in
     # property in random runs; dup_remat and remat_broken (spec 02 as written
     # before D-062) need about 20 steps, so each must fail its own scenario.
     # Witnesses must be violated.
-    must_hold calc_graph calc_graph_fixed safety
-    must_fail calc_graph calc_graph_mutant_no_stampede oneInFlight
-    must_fail calc_graph calc_graph_fixed notUnfulfilled
-    must_fail calc_graph calc_graph_fixed notMemoHit
-    must_fail calc_graph calc_graph_fixed notAttached
-    must_fail calc_graph calc_graph_fixed notRematerialised
-    must_fail calc_graph calc_graph_fixed notRetried
-    must_fail calc_graph calc_graph_fixed notFailedNode
-    quint test models/calc_graph.qnt --main=calc_graph_fixed
-    must_fail_test calc_graph calc_graph_mutant_dup_remat purgedTwiceTest
-    must_fail_test calc_graph calc_graph_mutant_remat_broken brokenNodeTest
+    must_hold calc_graph_instances calc_graph_fixed safety
+    must_fail calc_graph_instances calc_graph_mutant_no_stampede oneInFlight
+    must_fail calc_graph_instances calc_graph_fixed notUnfulfilled
+    must_fail calc_graph_instances calc_graph_fixed notMemoHit
+    must_fail calc_graph_instances calc_graph_fixed notAttached
+    must_fail calc_graph_instances calc_graph_fixed notRematerialised
+    must_fail calc_graph_instances calc_graph_fixed notRetried
+    must_fail calc_graph_instances calc_graph_fixed notFailedNode
+    quint test models/calc_graph_scenarios.qnt --main=calc_graph_fixed
+    must_fail_test calc_graph_scenarios calc_graph_mutant_dup_remat purgedTwiceTest
+    must_fail_test calc_graph_scenarios calc_graph_mutant_remat_broken brokenNodeTest
+    # D-063: a lost recomputation is retried, then ends its waiting steps.
+    must_fail_test calc_graph_scenarios calc_graph_mutant_remat_lost lostRematWaiterTest
+    # Ephemeral tier (spec 23, D-066). Each mutant removes one control and
+    # must break the property that guards it; the witness must be violated.
+    must_hold ephemeral_tier tier safety
+    must_fail ephemeral_tier tier_mutant_no_cascade durablePrereqsDurable
+    must_fail ephemeral_tier tier_mutant_no_promote durableUsesDurable
+    must_fail ephemeral_tier tier_mutant_no_running_guard runningNodePresent
+    must_fail ephemeral_tier tier_mutant_no_dep_guard noDangling
+    must_fail ephemeral_tier tier_mutant_no_evict capHolds
+    must_fail ephemeral_tier tier notPromoted
+    # Release impact gate (specs 24 and 05, D-067). Each mutant removes one
+    # control and must break the property that guards it.
+    must_hold release_impact impact safety
+    must_fail release_impact impact_mutant_no_base_stale gateHeldAtActivation
+    must_fail release_impact impact_mutant_no_gate gateHeldAtActivation
+    must_fail release_impact impact_mutant_no_signer_check signerIndependent
+    must_fail release_impact impact_mutant_no_open_check noOpenAtSignOff
+    must_fail release_impact impact notActivatedAfterImpact
+    # Scenario register (spec 25, D-068). Each mutant removes one control.
+    must_hold scenario_register register safety
+    must_fail scenario_register register_mutant_no_signer_check approverIndependent
+    must_fail scenario_register register_mutant_edit_after_submit contentFrozen
+    must_fail scenario_register register_mutant_run_any_status runsOnlyApproved
+    must_fail scenario_register register_mutant_no_retire_clear scheduledApproved
+    must_fail scenario_register register_mutant_no_replace oneScheduled
+    must_fail scenario_register register notScheduled
+    # P&L runs and residual review (spec 26, D-069). Each mutant removes one control.
+    must_hold pnl_explain pnl safety
+    must_fail pnl_explain pnl_mutant_no_prior_check computedHasPrior
+    must_fail pnl_explain pnl_mutant_bad_residual residualConsistent
+    must_fail pnl_explain pnl_mutant_no_independence acceptorIndependent
+    must_fail pnl_explain pnl_mutant_no_alert overdueAlerted
+    must_fail pnl_explain pnl_mutant_no_supersede oneCurrent
+    must_fail pnl_explain pnl notAccepted
     echo "models: all checks as expected"
   '';
 

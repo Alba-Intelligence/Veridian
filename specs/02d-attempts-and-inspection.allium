@@ -1,0 +1,149 @@
+-- allium: 3
+-- 02d-attempts-and-inspection.allium
+
+-- Scope: The rerun recipe and attempt log kept with every node, and the
+--   inspection surface with the rerun of a purged payload (D-064). Part of the
+--   calculation graph (02-calculation-graph).
+
+use "./01-bitemporal-data.allium" as data
+use "./05-configuration-release.allium" as cfg
+use "./02-calculation-graph.allium" as graph
+use "./02c-payload-retention.allium" as ret
+use "./02b-node-execution.allium" as exec
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The environment a worker ran in: what, besides the node's inputs, a rerun of
+-- the same payload needs to match (D-064). Immutable; shared by every attempt
+-- that ran in it.
+entity RunEnvironment {
+    build_hash: String
+    julia_version: String
+    release: cfg/ConfigurationRelease
+    threads: Integer
+    -- Version of the fixed reduction order used when a job runs threads (D-030).
+    reduction_order: String
+}
+
+-- One dispatch of a computation or of a recomputation, as it happened (D-064).
+-- Kept for as long as its node and never purged with the payload, so a failed
+-- or purged node can still be inspected and its run repeated. The log excerpt
+-- is bounded by config.max_log_excerpt.
+entity ComputationAttempt {
+    node: graph/CalculationNode
+    sequence: Integer
+    purpose: computation | recomputation
+    worker: data/User
+    environment: RunEnvironment
+    started_at: Timestamp
+    ended_at: Timestamp when outcome != running
+    outcome: running | succeeded | mismatched | rejected | crashed
+    -- Result of a finished run; for a recomputation that disagrees with the
+    -- node, the observed hash.
+    result_hash: String? when outcome = succeeded | mismatched
+    reason: String? when outcome = rejected | crashed
+    log_excerpt: String? when outcome = rejected | crashed
+
+    transitions outcome {
+        running -> succeeded
+        running -> mismatched
+        running -> rejected
+        running -> crashed
+        terminal: succeeded, mismatched, rejected, crashed
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Longest log excerpt kept on an attempt, in bytes (D-064).
+    max_log_excerpt: Integer = 8192
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Inspection (D-064): a person with the right reruns the exact payload of a
+-- node whose body was purged, to look at it. The node's recipe is what the
+-- rerun repeats; the result must still match result_hash, so it goes through
+-- the same recomputation as a waiting step would (no step waits for it, so a
+-- lost rerun only ends the cycle).
+rule RerunRequested {
+    -- model: calc_graph.rerun
+    when: NodeRerunRequested(user, node)
+    requires: data/permitted(user, "calc.inspect", node.calc_id)
+    requires: node.status = complete
+    requires: node.reproducible
+    requires: node.payload.tier = purged
+    requires: not node.payload.recomputing
+    ensures:
+        node.payload.recomputing = true
+        node.payload.recompute_attempts = 1
+        exec/RematerialisationRequested(payload: node.payload)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- At most one dispatch of a node runs at a time (D-064).
+invariant OneOpenAttemptPerNode {
+    for n in graph/CalculationNodes:
+        for a in n.attempt_log:
+            for b in n.attempt_log:
+                a != b implies not (a.outcome = running and b.outcome = running)
+}
+
+-- A complete node names the attempt that produced it (D-064).
+invariant CompleteNodeHasRecipe {
+    for n in graph/CalculationNodes:
+        n.status = complete implies n.computed_by.outcome = succeeded
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- A person who may look into how a node was computed (D-064).
+actor Inspector {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- How a node was computed, what happened on each attempt, and a rerun of a
+-- purged payload (D-064).
+surface NodeInspection {
+    facing inspector: Inspector
+    context node: graph/CalculationNode where data/permitted(inspector, "calc.inspect", node.calc_id)
+
+    exposes:
+        node.calc_id
+        node.model
+        node.as_of
+        node.inputs
+        node.prerequisite_nodes
+        node.status
+        node.failure_reason
+        node.computed_by
+        for a in node.attempt_log:
+            a.sequence
+            a.purpose
+            a.worker
+            a.environment
+            a.started_at
+            a.ended_at
+            a.outcome
+            a.reason
+            a.log_excerpt
+
+    provides:
+        NodeRerunRequested(inspector, node) when node.status = complete and node.payload.tier = purged
+}

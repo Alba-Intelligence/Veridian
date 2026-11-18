@@ -40,6 +40,7 @@ use "./01-bitemporal-data.allium" as data
 use "./02-calculation-graph.allium" as graph
 use "./05-configuration-release.allium" as cfg
 use "./07-julia-workers.allium" as workers
+use "./07b-compute-hosts.allium" as hosts
 use "./12-web-front-end-and-batch-console.allium" as web
 
 ------------------------------------------------------------
@@ -60,7 +61,7 @@ entity CostRateCard {
 entity ResourceUsage {
     ticket: workers/JobTicket
     node: graph/CalculationNode
-    host: workers/ComputeHost
+    host: hosts/ComputeHost
     measured_by: data/User
     cpu_seconds: Decimal
     wall_seconds: Decimal
@@ -72,7 +73,7 @@ entity ResourceUsage {
 -- Host time paid for: one record per host when it leaves, from its
 -- allocation (grid) or its configured cost (static host).
 entity CapacityRecord {
-    host: workers/ComputeHost
+    host: hosts/ComputeHost
     host_seconds: Decimal
     actual_cost: Decimal
     recorded_at: Timestamp
@@ -170,7 +171,7 @@ rule RecordUsage {
 }
 
 rule RecordCapacity {
-    when: host: workers/ComputeHost.presence becomes gone
+    when: host: hosts/ComputeHost.presence becomes gone
     ensures: CapacityRecord.created(
         host: host,
         host_seconds: host_seconds_of(host),
@@ -309,7 +310,7 @@ actor CostCentreOwner {
 ------------------------------------------------------------
 
 surface UsageMetering {
-    facing supervisor: workers/WorkerSupervisor
+    facing supervisor: hosts/WorkerSupervisor
 
     provides:
         UsageMeasured(supervisor, ticket, cpu_seconds, wall_seconds, peak_memory_mb, outcome)

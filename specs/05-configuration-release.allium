@@ -7,7 +7,7 @@
 --   development versus production releases; four-eyes through code review.
 -- Configuration covers: Julia code and model versions, generated schemas
 --   (D-018), planners, curve recipes, FRTB parameters, role-to-rights
---   mapping, batch schedules, retention settings.
+--   mapping, batch schedules, retention settings, impact tolerances (24).
 -- Excludes:
 --   - Data (trades, market data, calendars, reference data): bitemporal
 --     inputs, 01-bitemporal-data.allium.
@@ -23,6 +23,7 @@
 -- everything else keeps reusing results across releases.
 
 use "./01-bitemporal-data.allium" as data
+use "./24-release-impact.allium" as impact
 
 ------------------------------------------------------------
 -- Enumerations
@@ -106,6 +107,7 @@ rule ReceiveRelease {
 
 -- A verified release with a scheduled activation waits in received.
 rule ActivateScheduledRelease {
+    -- model: release_impact.activate
     when: release: ConfigurationRelease.activate_at <= now
     requires: release.status = received
     requires: verify_release(release)
@@ -114,22 +116,26 @@ rule ActivateScheduledRelease {
     -- Model risk (21, D-050, D-058): every model version the release adds or
     -- changes is validated.
     requires: release.kind = production implies models_cleared(release)
+    -- Impact (24, D-067): a release that changes figures has a signed-off,
+    -- current impact run.
+    requires: release.kind = production implies impact_cleared(release)
     ensures:
         release.status = active
         release.activated_at = now
         ReleaseActivated(release: release, previous: active_release(release.kind))
 }
 
--- A scheduled production release whose models are still not validated when
--- its time comes is refused, not left waiting.
+-- A scheduled production release whose models are still not validated, or
+-- whose impact is not signed off, when its time comes is refused, not left
+-- waiting.
 rule RefuseScheduledRelease {
     when: release: ConfigurationRelease.activate_at <= now
     requires: release.status = received
     requires: release.kind = production
-    requires: not models_cleared(release)
+    requires: not models_cleared(release) or not impact_cleared(release)
     ensures:
         release.status = refused
-        release.refusal_reason = "a model in the release has no current validation or has an open benchmark breach (21)"
+        release.refusal_reason = "a model in the release has no current validation or has an open benchmark breach (21), or its impact run is not signed off (24)"
 }
 
 -- A scheduled release that could not be activated (its verification failed
@@ -146,7 +152,7 @@ rule ExpireScheduledRelease {
 -- the golden test suite passed in CI (including calendar test vectors, 03),
 -- and, for production, at least one reviewer other than the author approved.
 rule ActivateRelease {
-    -- model: release_gate.activate
+    -- model: release_gate.activate release_impact.activate
     when: release: ConfigurationRelease.created
     requires: release.status = received
     requires: release.activate_at = null
@@ -154,10 +160,47 @@ rule ActivateRelease {
     requires: release.kind = production implies
         (release.reviewed_by.count >= 1 and not (release.authored_by in release.reviewed_by))
     requires: release.kind = production implies models_cleared(release)
+    requires: release.kind = production implies impact_cleared(release)
     ensures:
         release.status = active
         release.activated_at = now
         ReleaseActivated(release: release, previous: active_release(release.kind))
+}
+
+-- A release that changes figures waits in `received` for its impact run (24).
+-- When the run is signed off it activates, if everything else still holds.
+rule ActivateAfterImpact {
+    -- model: release_impact.activate
+    when: run: impact/ImpactRun.status becomes signed_off
+    let release = run.release
+    requires: release.status = received
+    requires: release.activate_at = null
+    requires: verify_release(release)
+    requires: release.reviewed_by.count >= 1 and not (release.authored_by in release.reviewed_by)
+    requires: models_cleared(release)
+    ensures:
+        release.status = active
+        release.activated_at = now
+        ReleaseActivated(release: release, previous: active_release(release.kind))
+}
+
+-- A rejected impact run ends the release; a new submission is needed.
+rule RefuseOnRejectedImpact {
+    -- model: release_impact.reject
+    when: run: impact/ImpactRun.status becomes rejected
+    requires: run.release.status = received
+    ensures:
+        run.release.status = refused
+        run.release.refusal_reason = "impact run rejected (24): " + run.reason
+}
+
+-- An unscheduled release that waits for its impact run does not wait for ever
+-- either (D-051).
+rule ExpireWaitingRelease {
+    when: release: ConfigurationRelease.received_at + config.scheduled_release_expiry <= now
+    requires: release.status = received
+    requires: release.activate_at = null
+    ensures: release.status = expired
 }
 
 rule RefuseRelease {
@@ -236,6 +279,8 @@ surface ReleaseIntake {
 -- (the currently active release of that kind, or null): black boxes.
 -- release_models(release), release_schedules(release): contents read from
 -- the release artefacts by the specs that need them (02, 06).
+-- impact_cleared(release): spec 24's gate (D-067): the release needs no impact
+-- run, or a current one is signed off.
 -- models_cleared(release): spec 21's gate, true when every model version the
 -- release adds or changes (graph model version, D-060), compared with the
 -- active release of that kind, has

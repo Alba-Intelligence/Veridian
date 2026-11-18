@@ -1,0 +1,100 @@
+-- allium: 3
+-- 10c-synthetic-data.allium
+
+-- Scope: Synthetic data: generation, and when it is refused. Part of 10.
+
+use "./01-bitemporal-data.allium" as data
+use "./05-configuration-release.allium" as cfg
+use "./10-data-ingestion-and-synthetic.allium" as ing
+use "./10b-golden-sets.allium" as gold
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A reproducible synthetic data set: market data, fixings, credit curves,
+-- volatility surfaces, dividends, or portfolios (e.g. 100 000 vanilla IRS for
+-- performance demonstration).
+entity SyntheticDataSet {
+    generator_code_hash: String
+    parameters_hash: String
+    seed: Integer
+    data_class: data/DataClass
+    requested_by: data/User
+    requested_at: Timestamp
+    production: generating | generated | refused
+    versions_recorded: Integer
+    refusal_reason: String when production = refused
+
+    transitions production {
+        generating -> generated
+        generating -> refused
+        terminal: generated, refused
+    }
+
+    invariant NeverProduction {
+        data_class in {synthetic, test, golden}
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule GenerateSyntheticData {
+    when: ing/SyntheticDataRequested(requester, generator_code_hash, parameters_hash, seed, data_class)
+    requires: data/permitted(requester, "synthetic.generate", data_class)
+    requires: data_class in {synthetic, test, golden}
+    requires: generator_in_active_release(generator_code_hash)
+    ensures: SyntheticDataSet.created(
+        generator_code_hash: generator_code_hash,
+        parameters_hash: parameters_hash,
+        seed: seed,
+        data_class: data_class,
+        requested_by: requester,
+        requested_at: now,
+        production: generating,
+        versions_recorded: 0
+    )
+}
+
+rule SyntheticDataGenerated {
+    when: SyntheticDataCompleted(generator, set, count)
+    requires: set.production = generating
+    ensures:
+        set.production = generated
+        set.versions_recorded = count
+}
+
+rule SyntheticDataRefused {
+    when: SyntheticDataFailed(generator, set, reason)
+    requires: set.production = generating
+    ensures:
+        set.production = refused
+        set.refusal_reason = reason
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor SyntheticGenerator {
+    identified_by: data/User
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface SyntheticProduction {
+    facing generator: SyntheticGenerator
+    context set: SyntheticDataSet where production = generating
+
+    provides:
+        SyntheticDataCompleted(generator, set, count)
+        SyntheticDataFailed(generator, set, reason)
+
+    @guarantee Reproducible
+        -- The same generator code, parameters and seed produce byte-identical
+        -- content hashes on any worker, at any time.
+}

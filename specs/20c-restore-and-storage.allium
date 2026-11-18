@@ -1,0 +1,126 @@
+-- allium: 3
+-- 20c-restore-and-storage.allium
+
+-- Scope: Restore drills and the measurement of storage and its alerts. Part of 20.
+-- Dependencies: 01, 02, 06, 07, 13, 20.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./06-batch-scheduling.allium" as batch
+use "./07-julia-workers.allium" as workers
+use "./13-report-review-alerts-trends.allium" as review
+use "./13b-alerts.allium" as alerts
+use "./20-production-operations.allium" as ops
+use "./20b-platform-releases.allium" as rel
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+enum StoreKind { ledger | payloads | audit | figures | reports }
+
+-- A rehearsal of recovery in an environment that is not production.
+entity RestoreDrill {
+    performed_by: data/User
+    performed_at: Timestamp
+    took: Duration
+    data_loss: Duration
+    objectives_met: Boolean
+    evidence_ref: String
+    reviewed_by: data/User?
+}
+
+-- One reading of how full a store is and how fast it grows.
+entity StorageMeasurement {
+    store: StoreKind
+    used_bytes: Integer
+    capacity_bytes: Integer
+    daily_growth_bytes: Integer
+    measured_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Drills prove that the objectives can be met, not just that backups exist.
+rule RecordRestoreDrill {
+    when: ops/RestoreDrillRecorded(operator, took, data_loss, evidence_ref)
+    requires: data/permitted(operator, "platform.drill", "restore")
+    ensures:
+        RestoreDrill.created(
+            performed_by: operator,
+            performed_at: now,
+            took: took,
+            data_loss: data_loss,
+            objectives_met: data_loss <= ops/config.recovery_point_objective
+                and took <= ops/config.recovery_time_objective,
+            evidence_ref: evidence_ref
+        )
+}
+
+-- Fires for the newest drill once the interval has passed. Before the first
+-- drill there is nothing to fire on, which is why go-live itself requires one
+-- (ProductionReadiness).
+rule RestoreDrillDue {
+    when: drill: RestoreDrill.performed_at + ops/config.restore_drill_interval <= now
+    requires: drill = newest_restore_drill()
+    ensures: alerts/Alert.created(
+        source: run_problem,
+        subject_ref: "restore drill",
+        description: "no restore drill within the agreed interval",
+        raised_at: now,
+        owner: platform_owner(),
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+rule RecordStorage {
+    when: StorageMeasured(collector, store, used_bytes, capacity_bytes, daily_growth_bytes)
+    requires: data/permitted(collector, "platform.measure", store)
+    ensures: StorageMeasurement.created(
+        store: store,
+        used_bytes: used_bytes,
+        capacity_bytes: capacity_bytes,
+        daily_growth_bytes: daily_growth_bytes,
+        measured_at: now
+    )
+}
+
+-- Either already too full, or on its present growth too full within the
+-- forecast horizon. Retention (13, 02) is configuration the bank can tighten,
+-- but the platform never purges what a retention class still requires.
+rule StorageRunningOut {
+    when: m: StorageMeasurement.created
+    requires: m.used_bytes >= m.capacity_bytes * ops/config.storage_warning_fraction
+        or m.used_bytes + m.daily_growth_bytes * ops/config.storage_forecast_horizon.days >= m.capacity_bytes
+    ensures: alerts/Alert.created(
+        source: run_problem,
+        subject_ref: m.store,
+        description: "store is filling up",
+        raised_at: now,
+        owner: platform_owner(),
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface StorageWatch {
+    facing collector: ops/PlatformService
+    context measurement: StorageMeasurement
+
+    exposes:
+        measurement.store
+        measurement.used_bytes
+        measurement.capacity_bytes
+        measurement.daily_growth_bytes
+        measurement.measured_at
+
+    provides:
+        StorageMeasured(collector, store, used_bytes, capacity_bytes, daily_growth_bytes)
+}

@@ -1,0 +1,321 @@
+-- allium: 3
+-- 26-pnl-and-explain.allium
+
+-- Scope: Daily profit and loss per book and its explanation (D-069, gap review
+--   item 3): hypothetical, actual and risk-theoretical P&L, an explain by risk
+--   component, a residual, and its review by product control.
+-- Includes: the P&L runs that follow each published batch run, their
+--   components, the residual finding and its acceptance, recording as
+--   reported figures, the effect of restatements.
+-- Excludes:
+--   - How a position is revalued and a sensitivity computed: Julia models of
+--     a release (07, 09, 17, 18, 11). P&L is a calculation of the graph like
+--     any other (02), memoized and reproducible.
+--   - The P&L attribution and backtesting tests of internal models (D-002):
+--     the three P&L kinds are produced so those tests can be added later.
+--   - The general ledger, fair value and valuation adjustments (gap review).
+-- Dependencies: 01, 02, 04, 05, 06, 11, 13.
+--
+-- The three P&L kinds (user choice, D-069), per book and business day d, in the
+-- reporting currency:
+--   - Hypothetical (HPL): the positions held at the close of the previous
+--     business day, revalued with the market of day d, minus their value at the
+--     previous close. No new trades, fees or adjustments.
+--   - Actual (APL): HPL plus the effect of trades done in day d, plus fees and
+--     booked adjustments and reserves of the day (a feed, 16).
+--   - Risk-theoretical (RTPL): the P&L the risk model explains: the previous
+--     day's sensitivities times the day's moves of the risk factors, by
+--     component, with carry. In v1 every risk factor is eligible.
+-- The residual is HPL minus RTPL. A request resolves its subjects at one
+-- knowledge time, so the day's own inputs resolve at the run's cut-off (06) and
+-- the previous day's inputs are pinned, as that run resolved them (02,
+-- pinned_inputs). The P&L of a day is thus reproduced from the two published
+-- runs it belongs to, whatever was corrected in between.
+--
+-- Governance (user choice): a residual beyond the tolerance of the release that
+-- is active when the P&L is computed is a finding. A product controller
+-- explains it and accepts it; the one who accepts is not responsible for the
+-- book. A finding left open after a business day raises an alert.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./06-batch-scheduling.allium" as batch
+use "./13-report-review-alerts-trends.allium" as report
+use "./13b-alerts.allium" as alerts
+use "./26b-pnl-restatement-and-review.allium" as pnlrev
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The P&L of one hierarchy node (book, desk, entity: sums of the books below
+-- in the reporting currency) from one published run, against the run before.
+entity PnlRun {
+    run: batch/BatchRun
+    prior_run: batch/BatchRun?
+    node_ref: String
+    as_of: Timestamp
+    prior_as_of: Timestamp? when prior_run != null
+    currency: String
+    status: pending | computed | unavailable | superseded
+    unavailable_reason: String? when status = unavailable
+    request: graph/CalculationRequest?
+    computed_at: Timestamp? when status = computed | superseded
+
+    transitions status {
+        pending -> computed
+        pending -> unavailable
+        computed -> superseded
+        unavailable -> superseded
+        terminal: superseded
+    }
+
+    figures: PnlFigure with pnl_run = this
+    components: PnlComponent with pnl_run = this
+    finding: PnlFinding with pnl_run = this
+}
+
+entity PnlFigure {
+    pnl_run: PnlRun
+    kind: hypothetical | actual | risk_theoretical
+    value: Decimal
+    source_calc_id: String
+}
+
+-- A part of the explanation. For the hypothetical P&L: the explained components
+-- and the residual. For the actual P&L: the bridge from HPL.
+entity PnlComponent {
+    pnl_run: PnlRun
+    basis: explain | bridge
+    component: carry | delta | vega | curvature | fx | other_explained | residual
+        | new_trades | fees_and_adjustments
+    risk_class: String?
+    value: Decimal
+    source_calc_id: String
+}
+
+-- The residual against its tolerance. `within` is recorded too, so the
+-- tolerance used and the ratio can be trended (13).
+entity PnlFinding {
+    pnl_run: PnlRun
+    hpl: Decimal
+    rtpl: Decimal
+    residual: Decimal
+    tolerance_abs: Decimal
+    tolerance_rel: Decimal
+    disposition: within | open | accepted
+    opened_at: Timestamp when disposition = open | accepted
+    review_due_at: Timestamp when disposition = open | accepted
+    explanation: String? when disposition = accepted
+    accepted_by: data/User? when disposition = accepted
+    accepted_at: Timestamp? when disposition = accepted
+    alerted: Boolean
+
+    transitions disposition {
+        open -> accepted
+        terminal: within, accepted
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Time given to explain a residual; one business day in the design,
+    -- written in hours because calendars are owned by Julia (03).
+    finding_review_window: Duration = 24.hours
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Each publication starts the P&L of every node of the run's perimeters,
+-- against the run published before it on the same schedule (none: unavailable).
+rule StartPnl {
+    -- model: pnl_explain.publish
+    when: pub: batch/RunPublication.created
+    requires: pub.run.rerun_mode != reproduce
+    let prior = prior_published_run(pub.run)
+    ensures:
+        for n in pnl_nodes(pub.run.schedule):
+            PnlRun.created(
+                run: pub.run,
+                prior_run: prior,
+                node_ref: n,
+                as_of: pub.run.as_of,
+                currency: reporting_currency(n),
+                status: if prior = null: unavailable else: pending,
+                unavailable_reason: if prior = null: "no earlier published run to compare with"
+            )
+}
+
+-- The calculation: one request of the production class over the two runs'
+-- positions and markets, pinned to their cut-offs. A durable request (23).
+rule RequestPnl {
+    -- model: pnl_explain.publish
+    when: p: PnlRun.created
+    requires: p.status = pending
+    ensures: p.request = graph/CalculationRequest.created(
+        requested_by: platform_service(),
+        model: pnl_model(),
+        subjects: pnl_subjects(p.run, p.node_ref),
+        pinned_inputs: prior_run_inputs(p.prior_run, p.node_ref),
+        data_class: production,
+        as_of: p.as_of,
+        known_at: p.run.cutoff,
+        origin_ref: pnl_ref(p),
+        requested_at: now,
+        status: open,
+        plan_expanded: false
+    )
+}
+
+-- The result holds the three P&Ls, their components and the residual. The
+-- finding is made in the same step: within tolerance or open.
+rule PnlCompletes {
+    -- model: pnl_explain.complete
+    when: r: PnlRun.request.status transitions_to fulfilled
+    let p = r
+    requires: p.status = pending
+    let out = pnl_result(p.request)
+    let tol = pnl_tolerance(cfg/active_release(production), p.node_ref)
+    ensures:
+        p.status = computed
+        p.computed_at = now
+        for k in {hypothetical, actual, risk_theoretical}:
+            PnlFigure.created(pnl_run: p, kind: k, value: out.value_of(k), source_calc_id: out.calc_id)
+        for c in out.components:
+            PnlComponent.created(
+                pnl_run: p, basis: c.basis, component: c.component,
+                risk_class: c.risk_class, value: c.value, source_calc_id: out.calc_id
+            )
+        PnlFinding.created(
+            pnl_run: p,
+            hpl: out.value_of(hypothetical),
+            rtpl: out.value_of(risk_theoretical),
+            residual: out.value_of(hypothetical) - out.value_of(risk_theoretical),
+            tolerance_abs: tol.abs,
+            tolerance_rel: tol.rel,
+            disposition:
+                if abs(out.value_of(hypothetical) - out.value_of(risk_theoretical))
+                    <= max(tol.abs, tol.rel * abs(out.value_of(hypothetical))): within
+                else: open,
+            review_due_at: now + config.finding_review_window,
+            alerted: false
+        )
+        if abs(out.value_of(hypothetical) - out.value_of(risk_theoretical))
+                <= max(tol.abs, tol.rel * abs(out.value_of(hypothetical))):
+            PnlReleasable(pnl_run: p)
+}
+
+rule PnlFails {
+    -- model: pnl_explain.failPnl
+    when: r: PnlRun.request.status transitions_to unfulfilled
+    requires: r.status = pending
+    ensures:
+        r.status = unavailable
+        r.unavailable_reason = "the calculation did not complete"
+}
+
+-- A product controller explains the residual and accepts it. Not the person
+-- responsible for the book.
+rule AcceptResidual {
+    -- model: pnl_explain.accept
+    when: pnlrev/ResidualAccepted(reviewer, finding, explanation)
+    requires: finding.disposition = open
+    requires: finding.pnl_run.status = computed
+    requires: data/permitted(reviewer, "pnl.review", finding.pnl_run.node_ref)
+    requires: reviewer != responsible_for(finding.pnl_run.node_ref)
+    ensures:
+        finding.disposition = accepted
+        finding.explanation = explanation
+        finding.accepted_by = reviewer
+        finding.accepted_at = now
+        PnlReleasable(pnl_run: finding.pnl_run)
+}
+
+-- Left open for a business day: an alert to the owner of the node (13).
+rule FindingOverdue {
+    -- model: pnl_explain.tick
+    when: f: PnlFinding.review_due_at <= now
+    requires: f.disposition = open
+    requires: not f.alerted
+    ensures:
+        f.alerted = true
+        alerts/Alert.created(
+            source: rule_breach,
+            subject_ref: pnl_ref(f.pnl_run),
+            description: "P&L residual not explained",
+            raised_at: now,
+            owner: responsible_for(f.pnl_run.node_ref),
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The residual is what the risk model does not explain.
+invariant ResidualIsDifference {
+    -- model: pnl_explain.residualConsistent
+    for f in PnlFindings:
+        f.residual = f.hpl - f.rtpl
+}
+
+-- Explained components add up to the risk-theoretical P&L, and with the residual
+-- to the hypothetical one.
+invariant ExplainAddsUp {
+    -- model: pnl_explain.residualConsistent
+    for p in PnlRuns where status = computed:
+        p.components.where(basis = explain and component != residual).sum(value) = p.finding.rtpl
+}
+
+-- No P&L is computed without a prior published run to compare with.
+invariant ComputedHasPrior {
+    -- model: pnl_explain.computedHasPrior
+    for p in PnlRuns where status = computed:
+        p.prior_run != null
+}
+
+-- The one who accepts a residual is not responsible for the book.
+invariant AcceptorIsIndependent {
+    -- model: pnl_explain.acceptorIndependent
+    for f in PnlFindings where disposition = accepted:
+        f.accepted_by != responsible_for(f.pnl_run.node_ref)
+}
+
+-- Superseded runs stay for audit, but no two are current for a day and node.
+------------------------------------------------------------
+-- Deferred Specifications
+------------------------------------------------------------
+
+-- Black boxes owned by Elixir (and Julia for the model):
+--   prior_published_run(run): the run most recently published (in effect)
+--     before it on the same schedule, or null.
+--   pnl_nodes(schedule), reporting_currency(node), responsible_for(node):
+--     hierarchy nodes of the schedule's perimeters (16), a node's currency
+--     (11) and the person responsible for it (04).
+--   prior_run_inputs(run, node): the input versions the earlier run resolved
+--     for the node (positions and markets), pinned in the request.
+--   pnl_model(), pnl_subjects(run, node), pnl_ref(p),
+--   pnl_result(request), platform_service(), figure_retention(publication): the
+--     model of a release that computes the three P&Ls, their components and
+--     the residual from both runs' positions, markets and sensitivities; its
+--     subjects; the origin reference; the result read back.
+--   pnl_tolerance(release, node): absolute and relative tolerance of the
+--     residual, per node, read from the release (05), never from a candidate
+--     (24).
+-- Fees and adjustments are a new feed kind of 10 and 16 (pnl_adjustments).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Which risk factors count as eligible for the risk-theoretical P&L (modellable under MAR31)? In v1 all, and the choice matters only once internal models are in scope (D-002)."
+open question "Should the actual P&L also be split by trade for product control, or is the bridge by component enough?"
+open question "Does a restated day need its own acceptance of the new residual, or may a controller carry over the earlier one when the difference is unchanged?"

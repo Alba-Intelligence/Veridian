@@ -1,0 +1,191 @@
+-- allium: 3
+-- 21b-model-validation.allium
+
+-- Scope: Independent validation of models: recording, supersession, expiry,
+--   withdrawal and overdue conditions. Part of 21.
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./13-report-review-alerts-trends.allium" as review
+use "./13b-alerts.allium" as alerts
+use "./21-model-risk-management.allium" as mrm
+use "./21c-benchmarks-and-breaches.allium" as brc
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- An independent validation of one model version.
+entity ModelValidation {
+    entry: mrm/ModelInventoryEntry
+    model_version: graph/ModelVersion
+    validator: data/User
+    outcome: mrm/ValidationOutcome
+    -- What the model is approved for, as a content hash of the scope
+    -- document (instrument kinds, ranges, data classes).
+    scope_hash: String
+    conditions: String?
+    conditions_due_at: Timestamp?
+    -- The largest difference to the independent reference that still counts
+    -- as agreement, set by the validator.
+    benchmark_tolerance: Decimal
+    evidence_ref: String
+    validated_at: Timestamp
+    valid_until: Timestamp
+    state: current | expired | superseded | withdrawn
+
+    transitions state {
+        current -> expired
+        current -> superseded
+        current -> withdrawn
+        terminal: expired, superseded, withdrawn
+    }
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Validation is recorded by a person from the validation function who is
+-- neither the owner nor the author of the release that carried the version.
+rule RecordValidation {
+    -- model: release_gate.recordValidation
+    when: ValidationRecorded(validator, entry, model_version, outcome, scope_hash, conditions?, conditions_due_at?, benchmark_tolerance, evidence_ref)
+    requires: entry.status = in_inventory
+    requires: model_version.function_name = entry.function_name
+    requires: data/permitted(validator, "model.validate", entry.function_name)
+    requires: data/freshly_authenticated(validator)
+    requires: validator != entry.owner
+    requires: validator != model_version.first_release.authored_by
+    requires: outcome = approved_with_conditions implies conditions != null
+    requires: benchmark_tolerance > 0
+    ensures: ModelValidation.created(
+        entry: entry,
+        model_version: model_version,
+        validator: validator,
+        outcome: outcome,
+        scope_hash: scope_hash,
+        conditions: conditions,
+        conditions_due_at: conditions_due_at,
+        benchmark_tolerance: benchmark_tolerance,
+        evidence_ref: evidence_ref,
+        validated_at: now,
+        valid_until: now + validation_interval(entry.tier),
+        state: current
+    )
+}
+
+-- Exactly one current validation per model version.
+rule SupersedePreviousValidation {
+    when: validation: ModelValidation.created
+    ensures: ValidationSuperseding(
+        entry: validation.entry,
+        model_version: validation.model_version,
+        keep: validation
+    )
+}
+
+rule SupersedeOne {
+    when: ValidationSuperseding(entry, model_version, keep)
+    ensures:
+        for old in other_current_validations(model_version, keep):
+            ValidationReplaced(validation: old)
+}
+
+rule ReplaceValidation {
+    when: ValidationReplaced(validation)
+    requires: validation.state = current
+    ensures: validation.state = superseded
+}
+
+-- A validation runs out: the owner is told at once. Releases already in
+-- production keep running (a regulatory run is never stopped by a clock), but
+-- no production release carrying this version can be activated until it is
+-- validated again (05, gate below).
+rule ValidationExpires {
+    -- model: release_gate.expire
+    when: validation: ModelValidation.valid_until <= now
+    requires: validation.state = current
+    ensures:
+        validation.state = expired
+        alerts/Alert.created(
+            source: run_problem,
+            subject_ref: validation.entry.function_name,
+            description: "model validation has expired",
+            raised_at: now,
+            owner: validation.entry.owner,
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule WithdrawValidation {
+    -- model: release_gate.withdraw
+    when: ValidationWithdrawn(validator, validation, reason)
+    requires: validation.state = current
+    requires: data/permitted(validator, "model.validate", validation.entry.function_name)
+    requires: data/freshly_authenticated(validator)
+    ensures:
+        validation.state = withdrawn
+        alerts/Alert.created(
+            source: run_problem,
+            subject_ref: validation.entry.function_name,
+            description: reason,
+            raised_at: now,
+            owner: validation.entry.owner,
+            escalated: false,
+            alert_state: raised
+        )
+}
+
+rule ConditionsOverdue {
+    when: validation: ModelValidation.conditions_due_at <= now
+    requires: validation.state = current
+    requires: validation.outcome = approved_with_conditions
+    ensures: alerts/Alert.created(
+        source: run_problem,
+        subject_ref: validation.entry.function_name,
+        description: "condition of a model validation is overdue",
+        raised_at: now,
+        owner: validation.entry.owner,
+        escalated: false,
+        alert_state: raised
+    )
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant ValidatorIsIndependent {
+    -- model: release_gate.validatorIndependent
+    for v in ModelValidations:
+        v.validator != v.entry.owner
+            and v.validator != v.model_version.first_release.authored_by
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface ModelValidation_ {
+    facing validator: mrm/ModelValidator
+    context validation: ModelValidation
+
+    exposes:
+        validation.entry.function_name
+        validation.entry.tier
+        validation.model_version.version
+        validation.outcome
+        validation.scope_hash
+        validation.conditions
+        validation.conditions_due_at
+        validation.benchmark_tolerance
+        validation.valid_until
+        validation.state
+
+    provides:
+        ValidationRecorded(validator, entry, model_version, outcome, scope_hash, conditions?, conditions_due_at?, benchmark_tolerance, evidence_ref)
+        ValidationWithdrawn(validator, validation, reason) when validation.state = current
+}
