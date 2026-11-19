@@ -1,5 +1,8 @@
 # Laptop spike report (D-043)
 
+> The prototype code and branches this report refers to are not part of this
+> repository. The report is published for its measurements and findings.
+
 Status: results of the 8-day spike, 2026-11-13 to 2026-11-14. Details, tables and
 commands are in `spike/README.md`; the code is in `spike/` (throw-away, D-043).
 Option B of section 4 was accepted on 2026-11-15 as D-044 (spec 07 amended),

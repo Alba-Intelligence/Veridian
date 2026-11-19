@@ -72,6 +72,11 @@ instance), and the gate requires the checks to still catch it.
 6. `models/README.md`: what each model covers and what it does not.
 7. `docs/design/decisions.md`: the decision log, with the reasoning.
 
+Large specs are split into parts that sit beside the main file and share its
+number: `02-calculation-graph.allium` is continued in `02b-node-execution`,
+`02c-payload-retention` and `02d-attempts-and-inspection`, and likewise for
+01, 04, 06, 07, 10, 13, 19, 20, 21, 25 and 26. Read the main file first.
+
 ## Run the checks
 
 ```
@@ -93,9 +98,11 @@ implementation must guarantee.
 
 ## Status and limits
 
-- Specifications and models only. The platform is to be built against them;
-  the next step for the models is replaying their traces against the real
-  code.
+- Specifications and models only. The platform is being built against them,
+  in a private repository. The first code, the calculation-graph ledger rules,
+  replays the traces of `models/calc_graph.qnt` and agrees with the model at
+  every step; replay for the other models is still to come. That code is not
+  published.
 - The models are checked by random simulation. A model covers a small instance,
   so absence of a violation is evidence, not proof. Exhaustive checking with
   Apalache was tried and is not yet practical at useful depth
@@ -104,7 +111,9 @@ implementation must guarantee.
 - A laptop spike measured dispatch overhead, ledger throughput and Slurm
   behaviour (host-loss detection by our heartbeat in about 5 s against about 50 s
   for Slurm itself). Its report is `docs/design/spike-report.md`; the prototype
-  code is not published.
+  code is not published. Further laptop measurements (memo lookup at 100
+  million nodes, end-of-day throughput, storage per node) are in
+  `docs/design/local-measurements.md`.
 - The regulatory extracts and reference values used while drafting are not
   redistributed here; see `docs/regulatory/README.md`.
 

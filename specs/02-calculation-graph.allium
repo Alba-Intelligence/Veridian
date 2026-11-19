@@ -23,7 +23,9 @@
 -- Identity rule (the heart of memoization):
 --   calc_id = hash(model version identity, as_of, content hashes of the
 --                  resolved input versions, result_hash of each prerequisite
---                  node, calculation context)
+--                  node)
+--   There is no "calculation context" in v1 (D-072, correcting D-003):
+--   anything that must change identity enters through input versions.
 --   The request's known_at chooses which versions are resolved but is NOT
 --   hashed, so identical data reached at different times reuses results.
 --   Hashing prerequisite result_hash (not prerequisite calc_id) gives early
