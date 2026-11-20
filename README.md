@@ -7,10 +7,11 @@ risk-calculation platform for bank market-risk regulation: content-addressed
 calculations recorded in a ledger, bitemporal data, a tamper-evident audit
 log, four-eyes release control and independent model validation.
 
-This repository is **Veridian Spec**: the specifications and the models, not
-the platform. It exists to show how a system with two very different halves
-can be specified precisely, checked by tools, and reviewed by people who do
-not read code.
+This repository is **Veridian Spec**: the specifications and the models, and
+the first code built against them. It exists to show how a system with two very
+different halves can be specified precisely, checked by tools, reviewed by
+people who do not read code, and then implemented so that the code is checked
+against the models.
 
 | Component | Role |
 |---|---|
@@ -56,6 +57,12 @@ used to make this approach rare.
 - **Release gate (specs 05 and 21, `models/release_gate.qnt`).** One lapsed
   validation blocked every new release, even one that changed no model. Decided:
   the gate looks only at the model versions a release adds or changes.
+- **Shared layers (spec 02e, `models/hub_layers.qnt`).** Very many instruments
+  share a few inputs (one USD swap curve, its discount factors and bumped
+  curves). The model checks the design that computes such declared hubs once,
+  layer by layer, sends each payload to a host once, and gives dependents only
+  to hosts that already hold their hubs; five mutants, one per control, are
+  each caught.
 
 The old behaviour stays in each model as a *negative control* (a `mutant`
 instance), and the gate requires the checks to still catch it.
@@ -74,7 +81,7 @@ instance), and the gate requires the checks to still catch it.
 
 Large specs are split into parts that sit beside the main file and share its
 number: `02-calculation-graph.allium` is continued in `02b-node-execution`,
-`02c-payload-retention` and `02d-attempts-and-inspection`, and likewise for
+`02c-payload-retention`, `02d-attempts-and-inspection` and `02e-shared-layers`, and likewise for
 01, 04, 06, 07, 10, 13, 19, 20, 21, 25 and 26. Read the main file first.
 
 ## Run the checks
@@ -89,6 +96,21 @@ model checks (random simulation, 20000 runs per check by default;
 All specs are checked together: a single spec alone gives spurious
 unresolved-reference warnings.
 
+## The code
+
+| Path | What it is | Check |
+|---|---|---|
+| `julia/VeridianCanonical/` | The canonical form of results and input content, and their hashes (scheme `sha256_v1`): typed money, rates, discount factors and year fractions, exact half-even rounding; frozen vectors from an independent Python implementation | `devenv shell -- veridian-julia-test` |
+| `control_plane/` | The Elixir control plane so far: the calculation-graph ledger in PostgreSQL through Ash (bundled writes, row locks, memo hits), bitemporal input versions with point-in-time resolution, typed scheme-named identifiers, and the `calc_id` encoding | `devenv shell -- veridian-test` (and `veridian-dialyzer`) |
+
+The ledger's rules are a pure state machine that replays the traces of
+`models/calc_graph.qnt` step for step, against the real database as well;
+property tests check bundled operations against the same machine; and every
+database constraint names the model property, model type or spec construct it
+enforces (`docs/design/decisions.md`, D-072 to D-082). The tests use a
+throwaway PostgreSQL cluster under `~/.local/state/veridian-test`, started and
+stopped by the script.
+
 ## Implement it in your language
 
 The specs describe behaviour, not a programming language, but they assume two
@@ -98,11 +120,15 @@ implementation must guarantee.
 
 ## Status and limits
 
-- Specifications and models only. The platform is being built against them,
-  in a private repository. The first code, the calculation-graph ledger rules,
-  replays the traces of `models/calc_graph.qnt` and agrees with the model at
-  every step; replay for the other models is still to come. That code is not
-  published.
+- The platform is being built against these specifications. What is published
+  is the first slice: the canonical-form package, the ledger and input
+  versions. Workers, dispatch, identities and the front-ends are not built
+  yet; trace replay exists for `models/calc_graph.qnt` only.
+- Throughput was measured on a shared laptop (`docs/design/local-measurements.md`):
+  with bundles of 100, the whole ledger path runs at about 1,200 to 1,400 nodes
+  per second with durable commits (5,200 with bundles of 500), bound by commit
+  rate; the CPU cost was compared without wall time, by statement counts and
+  process CPU.
 - The models are checked by random simulation. A model covers a small instance,
   so absence of a violation is evidence, not proof. Exhaustive checking with
   Apalache was tried and is not yet practical at useful depth

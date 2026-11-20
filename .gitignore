@@ -1,4 +1,7 @@
 .devenv*
+# Build output of the Elixir control plane.
+control_plane/_build/
+control_plane/deps/
 devenv.local.nix
 devenv.local.yaml
 .direnv

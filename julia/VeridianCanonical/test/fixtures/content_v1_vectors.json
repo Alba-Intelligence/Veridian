@@ -1,0 +1,559 @@
+{
+ "scheme": "sha256_v1",
+ "domain": "veridian/content/sha256_v1",
+ "vectors": [
+  {
+   "name": "bool_true",
+   "value": {
+    "t": "bool",
+    "v": true
+   },
+   "bytes_hex": "1001",
+   "hash_hex": "dfde575267ea9b660ed2f60f387f62345dd5fd710b22c453ce091ef00ec522ff"
+  },
+  {
+   "name": "bool_false",
+   "value": {
+    "t": "bool",
+    "v": false
+   },
+   "bytes_hex": "1000",
+   "hash_hex": "19dd9acc79958ac75dc878bc1ef86a8de79d972b354ed0d3d73f40b0b5f8fed7"
+  },
+  {
+   "name": "int_min",
+   "value": {
+    "t": "int",
+    "v": "-9223372036854775808"
+   },
+   "bytes_hex": "118000000000000000",
+   "hash_hex": "5838dede1b380215b5adcc07bbe4eef6663f16212e01bcb89721ecda9367827c"
+  },
+  {
+   "name": "int_max",
+   "value": {
+    "t": "int",
+    "v": "9223372036854775807"
+   },
+   "bytes_hex": "117fffffffffffffff",
+   "hash_hex": "cb77477dd06eb948d3fc172cd13a9589bbe06548a06e9e04132c1357fc30895e"
+  },
+  {
+   "name": "string_unicode",
+   "value": {
+    "t": "string",
+    "v": "Zürich 東京 😀"
+   },
+   "bytes_hex": "1200000000000000135ac3bc7269636820e69db1e4baac20f09f9880",
+   "hash_hex": "feae509d2e474d658138fa96719a438eb13757d09e5b3b0fbe58cd79e2f80e87"
+  },
+  {
+   "name": "string_empty",
+   "value": {
+    "t": "string",
+    "v": ""
+   },
+   "bytes_hex": "120000000000000000",
+   "hash_hex": "2333df9c2b87adca631698fddb9c113a7900a63c3f4381e31695f25dc151dbbd"
+  },
+  {
+   "name": "date_epoch",
+   "value": {
+    "t": "date",
+    "y": 1970,
+    "m": 1,
+    "d": 1
+   },
+   "bytes_hex": "130000000000000000",
+   "hash_hex": "7257393de9506601ad1da0d4c3ea4db51e902f3614966029d102e41f5f6b8d54"
+  },
+  {
+   "name": "date_before_epoch",
+   "value": {
+    "t": "date",
+    "y": 1969,
+    "m": 12,
+    "d": 31
+   },
+   "bytes_hex": "13ffffffffffffffff",
+   "hash_hex": "277032807f020ec7938e5ae2429e2cd47462b47cf901a70ce507397b67f1d12d"
+  },
+  {
+   "name": "date_2026",
+   "value": {
+    "t": "date",
+    "y": 2026,
+    "m": 11,
+    "d": 20
+   },
+   "bytes_hex": "130000000000005129",
+   "hash_hex": "454fb627fc4bf329991b40077eed548dcdb62bfdc9d4a55033e83ea3e0909b23"
+  },
+  {
+   "name": "ts_negative",
+   "value": {
+    "t": "ts",
+    "v": "-1"
+   },
+   "bytes_hex": "14ffffffffffffffff",
+   "hash_hex": "9896379e5bf0622543d7b463b46ae9ddb13932d02f6a73935b3bd206a78e3193"
+  },
+  {
+   "name": "ts_2026",
+   "value": {
+    "t": "ts",
+    "v": "1795219200000000"
+   },
+   "bytes_hex": "14000660be0ab5c000",
+   "hash_hex": "7d7f29ebd79c65eae4c23620612e4a14781776a669ec0ea711451112b8b79b7e"
+  },
+  {
+   "name": "money_plain",
+   "value": {
+    "t": "money",
+    "cur": "USD",
+    "num": "12345",
+    "den": "100"
+   },
+   "bytes_hex": "20555344000000000000000731323334353030",
+   "hash_hex": "c299c96990f8356842200e642b1859857c9e6bd847781d0b8b63e27a41b618c7"
+  },
+  {
+   "name": "money_tie_down",
+   "value": {
+    "t": "money",
+    "cur": "EUR",
+    "num": "5",
+    "den": "100000"
+   },
+   "bytes_hex": "20455552000000000000000130",
+   "hash_hex": "d3774622569bcaac3b1144b722e0e5d068319f349703c9f6cabf90db985697ad"
+  },
+  {
+   "name": "money_tie_up",
+   "value": {
+    "t": "money",
+    "cur": "EUR",
+    "num": "15",
+    "den": "100000"
+   },
+   "bytes_hex": "20455552000000000000000132",
+   "hash_hex": "b14526f76a339aaf8200a5ecc6aeb8b122e24281480232a27829c2a1c5f994d0"
+  },
+  {
+   "name": "money_tie_negative",
+   "value": {
+    "t": "money",
+    "cur": "GBP",
+    "num": "-25",
+    "den": "100000"
+   },
+   "bytes_hex": "2047425000000000000000022d32",
+   "hash_hex": "c2af7d22821e664d365f92ba043615fac921446d90338a9d89eacd862e2d964b"
+  },
+  {
+   "name": "money_negative_zero",
+   "value": {
+    "t": "money",
+    "cur": "JPY",
+    "num": "-4",
+    "den": "100000"
+   },
+   "bytes_hex": "204a5059000000000000000130",
+   "hash_hex": "85410f17341c7fed0628d634ada906d8fe9ecb8b79de5ba82d9e024ab3a3911a"
+  },
+  {
+   "name": "money_float_0_1",
+   "value": {
+    "t": "money",
+    "cur": "USD",
+    "f64bits": "0x3fb999999999999a"
+   },
+   "bytes_hex": "20555344000000000000000431303030",
+   "hash_hex": "683f6a5e824ff6c76312efd0ba62429489aaa156306f1515e6486b313489c1d9"
+  },
+  {
+   "name": "money_float_tie_looking",
+   "value": {
+    "t": "money",
+    "cur": "USD",
+    "f64bits": "0x3f0a36e2eb1c432d"
+   },
+   "bytes_hex": "20555344000000000000000131",
+   "hash_hex": "acb24167be80b9e5b9496408974f541c50fbc929b5e5fb552d7a71bb61242b83"
+  },
+  {
+   "name": "money_float_negative_zero",
+   "value": {
+    "t": "money",
+    "cur": "USD",
+    "f64bits": "0x8000000000000000"
+   },
+   "bytes_hex": "20555344000000000000000130",
+   "hash_hex": "a96563b3eb6d23e6c959d1b8db42b226d1b59a159ccf1422e5df8bed9361af3c"
+  },
+  {
+   "name": "money_huge",
+   "value": {
+    "t": "money",
+    "cur": "USD",
+    "num": "1000000000000000000000000000001",
+    "den": "3"
+   },
+   "bytes_hex": "20555344000000000000002233333333333333333333333333333333333333333333333333333333333336363637",
+   "hash_hex": "5ea6c1f6064b0af5b99a548508051addffd370a6a265d644e39da9133e13df40"
+  },
+  {
+   "name": "rate_plain",
+   "value": {
+    "t": "rate",
+    "num": "25",
+    "den": "1000"
+   },
+   "bytes_hex": "2100000000000000053235303030",
+   "hash_hex": "ebe8a1b637f93d3533bd7457e3ef209e8b7a6486126afa0eeeb0b7bd984aee14"
+  },
+  {
+   "name": "rate_tie_even",
+   "value": {
+    "t": "rate",
+    "num": "5",
+    "den": "10000000"
+   },
+   "bytes_hex": "21000000000000000130",
+   "hash_hex": "ef12c3d6daef62702413e3ede932639514cd333df7f63126af7f7d4ceae455af"
+  },
+  {
+   "name": "rate_tie_odd",
+   "value": {
+    "t": "rate",
+    "num": "15",
+    "den": "10000000"
+   },
+   "bytes_hex": "21000000000000000132",
+   "hash_hex": "94705876da80ae73ce2ad61e0f4574e89401bd24e3736735774ed9c8e7ff43df"
+  },
+  {
+   "name": "rate_float",
+   "value": {
+    "t": "rate",
+    "f64bits": "0x3fa020c49ba5e354"
+   },
+   "bytes_hex": "2100000000000000053331353030",
+   "hash_hex": "dc3057fed6aae0bfaa47cdeb1f8be64094cc07dc5acd20fd418ddbd6288fb4d6"
+  },
+  {
+   "name": "df_one",
+   "value": {
+    "t": "df",
+    "num": "1",
+    "den": "1"
+   },
+   "bytes_hex": "2200000000000000073130303030303000000000000000022d36",
+   "hash_hex": "160d3e1c24c196a7e5d5c11593fb5f847480bd013557dd638b94b689947dbe03"
+  },
+  {
+   "name": "df_plain",
+   "value": {
+    "t": "df",
+    "num": "9512345678",
+    "den": "10000000000"
+   },
+   "bytes_hex": "2200000000000000073935313233343600000000000000022d37",
+   "hash_hex": "5ea40fc3adfa55ce291ecf79fd176f49b85589dee350ade3445f013a977aae8f"
+  },
+  {
+   "name": "df_carry",
+   "value": {
+    "t": "df",
+    "num": "99999995",
+    "den": "100000000"
+   },
+   "bytes_hex": "2200000000000000073130303030303000000000000000022d36",
+   "hash_hex": "160d3e1c24c196a7e5d5c11593fb5f847480bd013557dd638b94b689947dbe03"
+  },
+  {
+   "name": "df_tie_even",
+   "value": {
+    "t": "df",
+    "num": "12345675",
+    "den": "100000000"
+   },
+   "bytes_hex": "2200000000000000073132333435363800000000000000022d37",
+   "hash_hex": "9cab81d3cc10087b2c7e112855397da08e827862fdc7e798150b4f793ccc59a2"
+  },
+  {
+   "name": "df_tiny",
+   "value": {
+    "t": "df",
+    "num": "123456789",
+    "den": "1000000000000000"
+   },
+   "bytes_hex": "2200000000000000073132333435363800000000000000032d3133",
+   "hash_hex": "3f67c10ad5f1b2fb0f2d287a8eedf620c41dbc4b7e0345b60c96047e9b358567"
+  },
+  {
+   "name": "df_large",
+   "value": {
+    "t": "df",
+    "num": "123456789012",
+    "den": "1"
+   },
+   "bytes_hex": "22000000000000000731323334353638000000000000000135",
+   "hash_hex": "bdbca6df414cfc5a87d205b286e38a6c8d829cf2aad8556ab222c4f62f0e545e"
+  },
+  {
+   "name": "df_zero",
+   "value": {
+    "t": "df",
+    "num": "0",
+    "den": "1"
+   },
+   "bytes_hex": "22000000000000000130000000000000000130",
+   "hash_hex": "3d58acf09412538d3d527535d171f76c1575db017c9d02ae36da81dc411776b2"
+  },
+  {
+   "name": "df_negative",
+   "value": {
+    "t": "df",
+    "num": "-95",
+    "den": "100"
+   },
+   "bytes_hex": "2200000000000000082d3935303030303000000000000000022d37",
+   "hash_hex": "fe1936515efa37cd38a1bb8b8d856c398e70a97f490ccdf455862635d17f3310"
+  },
+  {
+   "name": "df_float",
+   "value": {
+    "t": "df",
+    "f64bits": "0x3fef9add3c0e56b8"
+   },
+   "bytes_hex": "2200000000000000073938373635343300000000000000022d37",
+   "hash_hex": "785d373a9df419fe8fcefc62540316941565dcaf4595689524dcdd50cb2f7162"
+  },
+  {
+   "name": "yf_reduced",
+   "value": {
+    "t": "yf",
+    "num": "182",
+    "den": "364"
+   },
+   "bytes_hex": "23000000000000000131000000000000000132",
+   "hash_hex": "9bead40a1f61a732f6af49445a05b79ea4466bd0be235523f2c8316394b9464b"
+  },
+  {
+   "name": "yf_act360",
+   "value": {
+    "t": "yf",
+    "num": "181",
+    "den": "360"
+   },
+   "bytes_hex": "2300000000000000033138310000000000000003333630",
+   "hash_hex": "f5ef61de868bf22fae881c924671ca8e91237029cdb01bdf5adc8d872785e667"
+  },
+  {
+   "name": "yf_zero",
+   "value": {
+    "t": "yf",
+    "num": "0",
+    "den": "7"
+   },
+   "bytes_hex": "23000000000000000130000000000000000131",
+   "hash_hex": "cf4087188e4a816ca4e227370a62d21688e14102b1270a5e7762f48604ece6cb"
+  },
+  {
+   "name": "yf_negative",
+   "value": {
+    "t": "yf",
+    "num": "-3",
+    "den": "12"
+   },
+   "bytes_hex": "2300000000000000022d31000000000000000134",
+   "hash_hex": "15c3ccf101af75ec867527568133b1ce120e5fd0cca3de02d2e926dfead95764"
+  },
+  {
+   "name": "list_empty",
+   "value": {
+    "t": "list",
+    "v": []
+   },
+   "bytes_hex": "300000000000000000",
+   "hash_hex": "ca601a33b787af9d2fe4753f3c59c400651a23fad3200cc352712dc27c901649"
+  },
+  {
+   "name": "list_mixed",
+   "value": {
+    "t": "list",
+    "v": [
+     {
+      "t": "int",
+      "v": "1"
+     },
+     {
+      "t": "string",
+      "v": "a"
+     },
+     {
+      "t": "bool",
+      "v": true
+     }
+    ]
+   },
+   "bytes_hex": "300000000000000003110000000000000001120000000000000001611001",
+   "hash_hex": "b6284d3858e0d6881b1a1bd2b5f34ead18a689f905dfde0c743998cf5e0dcee7"
+  },
+  {
+   "name": "list_order_a",
+   "value": {
+    "t": "list",
+    "v": [
+     {
+      "t": "int",
+      "v": "1"
+     },
+     {
+      "t": "int",
+      "v": "2"
+     }
+    ]
+   },
+   "bytes_hex": "300000000000000002110000000000000001110000000000000002",
+   "hash_hex": "a8516c1913556ab186702e7aa315df0e9dac62e96f9810264114a70a19d91208"
+  },
+  {
+   "name": "list_order_b",
+   "value": {
+    "t": "list",
+    "v": [
+     {
+      "t": "int",
+      "v": "2"
+     },
+     {
+      "t": "int",
+      "v": "1"
+     }
+    ]
+   },
+   "bytes_hex": "300000000000000002110000000000000002110000000000000001",
+   "hash_hex": "904dee37ee5ea4af75853246729b57ac28b7de797579d9bf21f56d4950a948a7"
+  },
+  {
+   "name": "record_sorted_fields",
+   "value": {
+    "t": "record",
+    "v": {
+     "pv": {
+      "t": "money",
+      "cur": "USD",
+      "num": "1234567",
+      "den": "100"
+     },
+     "dv01": {
+      "t": "money",
+      "cur": "USD",
+      "num": "-4321",
+      "den": "1000"
+     },
+     "curve": {
+      "t": "list",
+      "v": [
+       {
+        "t": "df",
+        "num": "99",
+        "den": "100"
+       },
+       {
+        "t": "df",
+        "num": "97",
+        "den": "100"
+       },
+       {
+        "t": "df",
+        "num": "94",
+        "den": "100"
+       }
+      ]
+     },
+     "as_of": {
+      "t": "ts",
+      "v": "1795219200000000"
+     },
+     "id": {
+      "t": "string",
+      "v": "swap-1"
+     }
+    }
+   },
+   "bytes_hex": "310000000000000005000000000000000561735f6f6614000660be0ab5c000000000000000000563757276653000000000000000032200000000000000073939303030303000000000000000022d372200000000000000073937303030303000000000000000022d372200000000000000073934303030303000000000000000022d370000000000000004647630312055534400000000000000062d343332313000000000000000026964120000000000000006737761702d3100000000000000027076205553440000000000000009313233343536373030",
+   "hash_hex": "09923664b069e44b721f8ad57251a172f194e8884780270997844471c11e8c6b"
+  },
+  {
+   "name": "record_empty",
+   "value": {
+    "t": "record",
+    "v": {}
+   },
+   "bytes_hex": "310000000000000000",
+   "hash_hex": "94c5a98b5c038a01e17e9320d078d80c89166377981496df05f998d5ac274352"
+  },
+  {
+   "name": "record_name_byte_order",
+   "value": {
+    "t": "record",
+    "v": {
+     "é": {
+      "t": "int",
+      "v": "1"
+     },
+     "z": {
+      "t": "int",
+      "v": "2"
+     },
+     "B": {
+      "t": "int",
+      "v": "3"
+     }
+    }
+   },
+   "bytes_hex": "31000000000000000300000000000000014211000000000000000300000000000000017a1100000000000000020000000000000002c3a9110000000000000001",
+   "hash_hex": "cb2523761e3e4e1e21a69be131251df1b4d2d64d6cbe1cecacec33fc2dc18794"
+  },
+  {
+   "name": "string_boundary_a",
+   "value": {
+    "t": "list",
+    "v": [
+     {
+      "t": "string",
+      "v": "ab"
+     },
+     {
+      "t": "string",
+      "v": "c"
+     }
+    ]
+   },
+   "bytes_hex": "300000000000000002120000000000000002616212000000000000000163",
+   "hash_hex": "9fec3232fbf2c22fa52c54400a443a74ec10018ec49fc31ad17ccb0f29505fd2"
+  },
+  {
+   "name": "string_boundary_b",
+   "value": {
+    "t": "list",
+    "v": [
+     {
+      "t": "string",
+      "v": "a"
+     },
+     {
+      "t": "string",
+      "v": "bc"
+     }
+    ]
+   },
+   "bytes_hex": "300000000000000002120000000000000001611200000000000000026263",
+   "hash_hex": "4fbdae4fb6495e996931648af0a5bd3e03bec2a7b8614f0ed6b97bfb99919996"
+  }
+ ]
+}
