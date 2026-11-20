@@ -131,6 +131,16 @@ in
     must_fail pnl_explain pnl_mutant_no_alert overdueAlerted
     must_fail pnl_explain pnl_mutant_no_supersede oneCurrent
     must_fail pnl_explain pnl notAccepted
+    # Shared layers of the plan (spec 02e, D-077). Each mutant removes one
+    # control and must break the property that guards it; the witness must be
+    # violated.
+    must_hold hub_layers hubs safety
+    must_fail hub_layers hubs_mutant_no_layers hubAfterPrerequisites
+    must_fail hub_layers hubs_mutant_every_host_computes oneComputationPerHub
+    must_fail hub_layers hubs_mutant_cold_hosts dependentsRunOnWarmHosts
+    must_fail hub_layers hubs_mutant_mixed_bundles bundleSharesHubs
+    must_fail hub_layers hubs_mutant_no_cache payloadFetchedOncePerHost
+    must_fail hub_layers hubs notAllDone
     echo "models: all checks as expected"
   '';
 

@@ -15,6 +15,7 @@ Allium only.
 |---|---|---|
 | 07 julia-workers | bundled dispatch, heartbeat loss, ledger commit per bundle | `bundled_dispatch.qnt` (D-055, D-056) |
 | 02 calculation-graph | node completion and invalidation against the ledger | `calc_graph.qnt` (D-061) |
+| 02e shared-layers | declared hub layers, one computation per hub, payloads fetched once per host, dependents on warm hosts | `hub_layers.qnt` (D-077) |
 | 06 batch-scheduling | run cut-off, capacity request, resumption from the ledger | next (D-059) |
 | 20 production-operations | recovery, release freeze window, interrupted-run resume | next with 06 (D-059) |
 | 07 julia-workers, the rest | Slurm allocations, hosts joining, retiring, eviction, EOD array | next (D-059) |

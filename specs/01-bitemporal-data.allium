@@ -85,6 +85,7 @@ entity InputSeries {
 -- One immutable statement about a series over an effective period.
 entity InputVersion {
     series: InputSeries
+    -- Computed by the Julia canonical form, recorded as given (07 HashOwnership, D-081).
     content_hash: String
     effective_from: Timestamp
     effective_to: Timestamp?

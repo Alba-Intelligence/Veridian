@@ -134,6 +134,39 @@ contract JobGranularity {
         -- Dagger cluster mode across hosts: distribution is the graph's job.
 }
 
+-- Who computes which hash, and who decides what (D-081). Compute declares,
+-- control places: the Julia side defines the units of work and what each needs
+-- (the planner, D-020, D-077); the control plane decides where and when they
+-- run, moves their data and keeps the ledger. A hash is computed where its
+-- meaning is defined.
+contract HashOwnership {
+    content_hash_of: (content: Any, schema_ref: String) -> String
+
+    @invariant ContentHashedByCanonicalForm
+        -- The content_hash of an input version (01) is computed by the Julia
+        -- canonical form (D-075) under a named scheme (D-041), by an ingestion
+        -- job like any other calculation. Adapters, stewards and generators
+        -- pass content through it; the control plane records the hash and
+        -- never recomputes or alters it.
+
+    @invariant CalcIdByControlPlane
+        -- A node's calc_id (02) is computed by the control plane from the
+        -- model's code hash, the as_of, the input content hashes and the
+        -- prerequisite result hashes, without opening any payload: placement
+        -- and memo lookup need nothing else.
+
+    @invariant ResultHashedByProducer
+        -- A result_hash is computed by the worker that produced the result,
+        -- over the canonical form. It is checked by recomputation (02c), not
+        -- by the control plane, which does not read payloads.
+
+    @invariant MeaningNotBytes
+        -- A content or result hash identifies canonical meaning, not stored
+        -- bytes: two encodings of the same canonical content have one hash.
+        -- Corruption of stored bytes is detected by a separate checksum of
+        -- the storage layer.
+}
+
 ------------------------------------------------------------
 -- Entities and Variants
 ------------------------------------------------------------
@@ -319,7 +352,8 @@ surface BuildPublication {
 -- interactive requests, above development).
 -- queued_count(), priority_of(node), next_tickets_for(build, limit): queue
 -- black boxes; next_tickets_for returns up to `limit` queued tickets in
--- priority order that the build can run. A requeued ticket (assigned -> queued) happens only when a build is
+-- priority order that the build can run, and, when the plan has shared layers,
+-- only those the worker's host is warm for (02e HubAwareDispatch). A requeued ticket (assigned -> queued) happens only when a build is
 -- withdrawn while a job waits; its retry is still counted by the graph.
 
 ------------------------------------------------------------

@@ -9,6 +9,16 @@ traceability part.
 tickets, workers, results in flight, heartbeat loss declaration (including a
 false timeout), process death and one ledger transaction per bundle.
 
+`hub_layers.qnt` models the shared layers of a plan (spec 02e, D-077): hubs
+declared in layers, computed once, their payloads held once per host in a cache,
+and dependents given only to hosts that already hold the hubs they need, in
+bundles that need the same hubs. Instance `hubs` is the behaviour; each
+`hubs_mutant_*` removes one control and the gate requires it to break the
+property that guards it (`no_layers`, `every_host_computes`, `cold_hosts`,
+`mixed_bundles`, `no_cache`). Size: 4 hubs in two layers, 6 positions, 2 hosts,
+bundle of 2. Not modelled: which nodes are hubs, the fan-in fallback, payload
+size, cache eviction, host loss (open questions in spec 02e).
+
 Run with `devenv shell -- veridian-quint-check` (random simulation, offline;
 `VERIDIAN_QUINT_RUNS` sets the runs per check, default 20000). The simulator
 samples runs; it does not prove anything. Exhaustive checking (`quint verify`)

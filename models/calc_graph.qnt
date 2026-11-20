@@ -460,10 +460,23 @@ module calc_graph {
     STEPS.forall(s => stepSt.get(s) != Cancelled or reqSt.get(s._1) == Unfulfilled),
   }
 
+  // The shape of a node's record, enforced again by the ledger's database
+  // constraints result_iff_complete and complete_is_whole (D-080): a node has a
+  // result exactly when it is complete, and a complete node has a payload tier.
+  val resultIffComplete = NODES.forall(n =>
+    and {
+      (nodeSt.get(n) == Complete) == (resultHash.get(n) != 0),
+      nodeSt.get(n) != Complete or tier.get(n) != NoPayload,
+    })
+
+  // Counters never go below zero (database constraint counters_not_negative).
+  val countersNotNegative = NODES.forall(n =>
+    and { attempts.get(n) >= 0, rematInFlight.get(n) >= 0, rematAttempts.get(n) >= 0 })
+
   val safety = and {
     attemptsBounded, oneNodePerCalcId, oneInFlight, oneRematInFlight,
     noRematOnBroken, doneIsSound, abandonedHasCause, purgedWaiterHasRemat,
-    requestStatesAgree,
+    requestStatesAgree, resultIffComplete, countersNotNegative,
   }
 
   // ------------------------------------------------------------

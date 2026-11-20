@@ -140,3 +140,81 @@ than the spike's, so the payload figure needs the real models before it means an
 - Nothing measured here reopens D-039 or D-044.
 - The durable-commit rate at stress size, the memo-lookup partition rule (M1) and real
   payload sizes remain open and need production-class hardware or the real models.
+
+## Ledger through Ash (2026-11-20, D-073)
+
+The first production-code ledger (an Elixir application, PostgreSQL through the Ash
+framework) was measured on the same laptop with a throwaway cluster:
+`fsync` off, asynchronous commit, normal priority, 4,000 positions (12,000 rows in
+all). It measures the Elixir and Postgres CPU path. It is **not** durable commits
+and **not** 100 M rows.
+
+| Operation | One caller | 8 callers at once |
+|---|---|---|
+| Commit a bundle of 100 completions (one transaction) | 1,200 nodes/s | 5,800 nodes/s |
+| Bind a step that creates its node | 350/s | 1,600/s |
+| Bind a step to an existing complete node (memo hit) | 450/s | 2,000/s |
+| Submit one request with many steps (row by row) | 3,000 steps/s | |
+| Lookup by calc_id (one read) | p50 0.5 ms, p99 1.0 ms | |
+| **Whole path per node**: one request of 4,000 steps; 8 workers each bind, dispatch, commit a bundle of 100, finish the steps | | **700 nodes/s** |
+| Whole path per node with bundle calls (bind, dispatch, commit, finish, each one transaction per bundle of 100; D-074) | | **800 nodes/s** |
+| Submit one request of 4,000 steps, bulk insert (was 3,000/s row by row) | 22,000 steps/s | |
+| Whole path for memo hits (bind only) | | 2,000 nodes/s (one request, 8 workers, per-node bind) |
+
+**The whole path is below the ledger target of 1,000 nodes/s** (700 with one
+transaction per node, 800 with bundle calls: the cost is about 25 statements per
+node through the framework, not the transactions; at 800 nodes/s a 2.3 M-node plan
+needs about 48 minutes of ledger time here). Each operation
+looks fast alone, but a node costs several transactions: bind, dispatch and
+finishing its step are one transaction per node here, whereas only the commit is
+per bundle. The design (D-044) amortises dispatch and completion per bundle; the
+next step is to apply that to the rest of the path and measure again. These
+numbers are not comparable with the spike's whole-path figures, which skipped the
+framework and the row locks.
+
+### Update: bundle engine (2026-11-20, D-078)
+
+The ledger's bundle calls now read, lock and write each table once per bundle
+(constant statements per bundle) instead of per node. Same laptop, same setup
+(throwaway cluster, `fsync` off, asynchronous commit, 8 workers, bundles of 100):
+
+| Operation | 4,000 nodes | 20,000 nodes |
+|---|---|---|
+| **Whole path per node with bundle calls** (bind, dispatch, commit, finish) | **10,800 nodes/s** | **12,000 nodes/s** |
+| Memo hits through the bundle bind | | 13,000 nodes/s |
+| Commit a bundle of 100 completions, one committer | 18,000 nodes/s | |
+| Per-node calls (unchanged, for comparison) | 600 to 800 nodes/s | 630 nodes/s |
+
+These are with asynchronous commits (`fsync` off). The target of 1,000 nodes/s is
+judged on durable commits (D-044), measured on the same disk with `fsync`,
+synchronous commit and full-page writes on:
+
+| Bundle size | Whole path per node, durable | Memo hits through the bundle bind, durable |
+|---|---|---|
+| 100 | 1,200 to 1,400 nodes/s | 5,600 nodes/s |
+| 500 | 5,200 nodes/s | 14,900 nodes/s |
+
+Each bundle takes four commits (bind, dispatch, complete, finish) and the path is
+bound by commits, about 45 to 55 per second on this laptop disk. So the target is
+met durably, **narrowly at bundles of 100 and comfortably at 500**; production
+storage will change the commit rate. Not 100 M rows, not contended by other
+writers. Callers must use the bundle calls: per-node calls keep their old cost.
+
+### Ash bulk upsert against raw SQL (2026-11-20, D-079)
+
+The figures above used a raw-SQL write-back. The ledger now writes through Ash's
+bulk upsert instead. The machine was busy with other heavy work, so the two were
+compared on figures that do not depend on wall time (`veridian-ledger-cost`:
+exact counts, and CPU time of the BEAM and of the database processes; 4,000
+nodes, bundles of 100, 4 workers, one run each):
+
+| Per bundle / per node | Raw SQL | Ash bulk upsert |
+|---|---|---|
+| Statements per bundle | 23 | 23 |
+| Commits per bundle | 4 | 4 |
+| Database CPU per node | 150 µs | 155 µs |
+| BEAM CPU per node | 370 µs | 700 µs |
+
+Where commits are the limit (durable commits) the two are the same. Where CPU is
+the limit, Ash costs about 330 µs more per node, still more than 1,000 nodes/s on
+one core. The counts are exact; the CPU times are indicative.

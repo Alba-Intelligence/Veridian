@@ -1,0 +1,190 @@
+-- allium: 3
+-- 02e-shared-layers.allium
+
+-- Scope: Shared layers ("hubs") of a plan (D-077): the nodes that very many
+--   other nodes use, such as the USD swap curve, its fitted discount factors
+--   and its bumped curves. They are named in configuration, computed first in
+--   bulk, layer by layer, held once per host in a cache keyed by content, and
+--   the dependents are dispatched to hosts that already hold them. Part of the
+--   calculation graph (02-calculation-graph).
+-- Includes: the declaration of layers in a release, marking plan steps as
+--   hubs (declared, or by fan-in when nobody declared them), the per-host
+--   payload cache and its prefetch, and the rules that hub-aware dispatch
+--   follows when it chooses a bundle (specified here, used by 07d AssignJob).
+-- Excludes:
+--   - What a result is worth and when it is reused: the calc_id and early
+--     cutoff of 02. A hub is an ordinary node there; this file adds no way to
+--     compute or reuse a result, only to organise where and when.
+--   - Crash, retry and loss of a hub computation: 02b, 07d. Cache eviction
+--     and a host that loses its cache are not specified yet (open question).
+--   - Per-security nodes valued per unit and scaled to each position: a
+--     candidate refinement of D-039, not decided (open question).
+
+use "./01-bitemporal-data.allium" as data
+use "./02-calculation-graph.allium" as graph
+use "./05-configuration-release.allium" as cfg
+use "./07-julia-workers.allium" as core
+use "./07b-compute-hosts.allium" as hosts
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+-- Which tickets a worker takes (the `next_tickets_for` function of 07d
+-- AssignJob), when the plan has shared layers.
+contract HubAwareDispatch {
+    next_tickets_for: (worker: core/WorkerProcess, limit: Integer) -> List<core/JobTicket>
+
+    @invariant AssignOnWarmHost
+        -- model: hub_layers.computeHub hub_layers.assignBundle
+        -- A ticket whose node needs shared nodes (its prerequisite hubs) goes
+        -- only to a worker on a host that already holds the payload of every
+        -- one of them, and only once they are complete. A hub starts only
+        -- after the hubs it needs are complete and on that host. Among the
+        -- tickets that qualify, lower layers come first, then the usual order.
+
+    @invariant DependentsRunOnWarmHosts
+        -- model: hub_layers.dependentsRunOnWarmHosts
+        -- A node that needs hubs never runs on a host that lacks one of them:
+        -- a cold host is not given the node and made to wait for a transfer.
+
+    @invariant BundleSharesHubs
+        -- model: hub_layers.bundleSharesHubs
+        -- The nodes of one bundle need the same set of hubs, so a host
+        -- that takes a bundle needs each payload once for the whole bundle.
+
+    @invariant PayloadFetchedOncePerHost
+        -- model: hub_layers.payloadFetchedOncePerHost
+        -- A hub payload goes to a host at most once while it stays there:
+        -- at most one HostPayload exists for a host and a node.
+
+    @invariant OneComputationPerHub
+        -- model: hub_layers.oneComputationPerHub
+        -- A hub is computed once for the whole cluster, however many hosts
+        -- and dependents there are. This is the stampede control of 02b seen
+        -- from the hosts: a second host asked for the same hub attaches to
+        -- the first computation and fetches the result.
+
+    @invariant HubAfterPrerequisites
+        -- model: hub_layers.hubAfterPrerequisites
+        -- Layers are respected: a hub that has started has every prerequisite
+        -- hub complete.
+
+    @guidance
+        -- When the dependents of a hub outnumber the hosts, group them by
+        -- hub set before filling bundles, so the same few hubs serve many
+        -- consecutive bundles on the same host.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum HubBasis { declared | fan_in }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- A layer of hubs named by a configuration release, for example "usd swap
+-- curves" at rank 0 and "usd bumped curves" at rank 1. A hub of rank r needs
+-- only hubs of lower rank. The release is reviewed like any other
+-- configuration (05), so what counts as shared is a decision of people.
+entity SharedLayerDeclaration {
+    release: cfg/ConfigurationRelease
+    name: String
+    rank: Integer
+    models: Set<graph/ModelVersion>
+    subjects: Set<data/InputSeries>
+}
+
+-- A plan step that is a hub. Declared hubs are marked from the declaration
+-- with no counting; a step nobody declared is marked only when its observed
+-- fan-in in the plan reaches config.hub_fan_in_threshold.
+entity SharedStep {
+    step: graph/PlannedStep
+    basis: HubBasis
+    layer: SharedLayerDeclaration?
+    rank: Integer
+    -- Number of steps that depend on it, counted for fan_in hubs only.
+    fan_in: Integer?
+}
+
+-- The payload of a hub node is on a host: the host computed it or fetched it.
+-- It is kept for as long as the host serves (eviction is an open question).
+entity HostPayload {
+    host: hosts/ComputeHost
+    node: graph/CalculationNode
+    fetched_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Steps nobody declared become hubs from this many dependents upward.
+    hub_fan_in_threshold: Integer = 1000
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- A step that matches a declared layer is a hub, by declaration alone. Nothing
+-- is counted for it: the USD swap curve is known to be needed everywhere.
+rule PlanMarksDeclaredHubs {
+    when: step: graph/PlannedStep.created
+    requires: step.purpose = evaluation
+    let layer = declared_layer_for(step)
+    requires: layer != null
+    ensures: SharedStep.created(
+        step: step,
+        basis: declared,
+        layer: layer,
+        rank: layer.rank,
+        fan_in: null
+    )
+}
+
+-- Fallback for what nobody declared: once the plan is known, a step that many
+-- others depend on becomes a hub for this request, and the count is reported to
+-- the configuration owners as a candidate for declaration.
+rule PromoteByFanIn {
+    when: request: graph/CalculationRequest.plan_expanded becomes true
+    for step in request.steps where not is_hub(step):
+        let n = dependents_of(step).count
+        requires: n >= config.hub_fan_in_threshold
+        ensures:
+            SharedStep.created(step: step, basis: fan_in, layer: null, rank: hub_rank_of(step), fan_in: n)
+            HubCandidateObserved(model: step.model, fan_in: n, request: request)
+}
+
+-- The node of a hub is complete: its payload is on the host that computed it.
+rule HubCompleted {
+    -- model: hub_layers.finishHub
+    when: node: graph/CalculationNode.status transitions_to complete
+    requires: node.steps.any(s => is_hub(s))
+    let host = computing_host_of(node)
+    requires: not exists HostPayload{host, node}
+    ensures: HostPayload.created(host: host, node: node, fetched_at: now)
+}
+
+-- A host is about to be given dependents of a complete hub it does not hold:
+-- the payload is transferred once, and stays. The transfer is requested by
+-- dispatch before the dependents are assigned, not by the dependent at run time.
+rule PrefetchHubPayload {
+    -- model: hub_layers.fetch
+    when: HubPayloadWanted(host, node)
+    requires: node.status = complete
+    requires: not exists HostPayload{host, node}
+    ensures: HostPayload.created(host: host, node: node, fetched_at: now)
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Cache eviction: when a host evicts a payload for space, it may fetch it again. Is the number of refetches a measured quantity per run, and what bounds the cache (size, age, per layer)?"
+open question "Host loss: a host that dies loses its cache, and its hub payloads must be fetched again by its replacements. Should a replacement be warmed before it takes dependents, and by whom?"
+open question "Per-security nodes: should the nodes for one security be valued per unit of notional and scaled for each position (D-039 refinement)? Needs the real ratio of positions to distinct securities first."

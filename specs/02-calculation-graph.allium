@@ -10,7 +10,8 @@
 --   steps, the calculation node). Node execution and request outcomes are
 --   02b-node-execution, payload retention and recomputation
 --   02c-payload-retention, attempt records and inspection
---   02d-attempts-and-inspection.
+--   02d-attempts-and-inspection, shared layers of the plan (hubs, host
+--   payload caches, hub-aware dispatch) 02e-shared-layers (D-077).
 -- Excludes:
 --   - Bitemporal input versions (01-bitemporal-data.allium).
 --   - Identity, rights, audit (04-identity-access-audit.allium).

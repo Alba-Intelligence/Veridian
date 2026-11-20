@@ -221,4 +221,5 @@ surface JobChannel {
         demands JobGranularity
         demands graph/DeterministicComputation
         demands TestDoubles
+        demands core/HashOwnership
 }
