@@ -63,7 +63,7 @@ changes.
 ## 4. Gate
 
 `devenv shell -- veridian-spec-check` runs `allium check` on all specs,
-the traceability check, and the model checks (`veridian-quint-check`). It must
+the traceability check, the regulation-tag check (`tools/reg-trace.sh --check`, D-084), and the model checks (`veridian-quint-check`). It must
 pass before any commit that touches `specs/` or `models/`. A model check that
 is expected to be violated (a recorded finding) and stops being violated also
 fails the gate: the finding must be closed in the spec, the model and

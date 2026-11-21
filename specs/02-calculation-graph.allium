@@ -53,14 +53,19 @@ contract DeterministicComputation {
         -- variables, no direct database or network reads, no global state.
 
     @invariant Determinism
+        -- reg: BCBS239.P3
         -- Identical arguments produce a byte-identical result and therefore
         -- the same result_hash, on any worker, after any restart.
 
     @invariant CanonicalInputOrdering
+        -- reg: BCBS239.P3
+        -- test: control_plane/test/veridian/calc_id_test.exs julia/VeridianCanonical/test/runtests.jl
         -- Inputs and prerequisite results are consumed in a canonical order
         -- (sorted by content hash); set iteration order never affects output.
 
     @invariant CanonicalRounding
+        -- reg: BCBS239.P3
+        -- test: julia/VeridianCanonical/test/runtests.jl
         -- result_hash is computed over the canonical form of the result
         -- (D-004, D-015): rounding half-even; monetary amounts to 4 decimal
         -- places of the currency unit; rates and percentages to one hundredth

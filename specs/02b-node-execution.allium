@@ -253,6 +253,7 @@ rule PlanningFails {
 ------------------------------------------------------------
 
 invariant OneNodePerCalcId {
+    -- reg: BCBS239.P3
     -- model: calc_graph.oneNodePerCalcId
     for a in graph/CalculationNodes:
         for b in graph/CalculationNodes:

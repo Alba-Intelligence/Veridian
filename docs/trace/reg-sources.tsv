@@ -1,0 +1,5 @@
+prefix	title	url
+BCBS239	BCBS 239, Principles for effective risk data aggregation and risk reporting (2013); IDs are principle numbers, P1 to P14	https://www.bis.org/publ/bcbs239.htm
+MAR21	Basel Framework, chapter MAR21 (sensitivities-based method); IDs are MAR21 paragraph numbers. The Framework is one document for all chapters	https://www.bis.org/committees/bcbs/basel-framework/standard/mar
+MAR22	Basel Framework, chapter MAR22 (default risk capital requirement); IDs are MAR22 paragraph numbers. The Framework is one document for all chapters	https://www.bis.org/committees/bcbs/basel-framework/standard/mar
+CRR	Regulation (EU) No 575/2013 (CRR) as consolidated; IDs are ArtNNN(para)(sub)	https://eur-lex.europa.eu/eli/reg/2013/575/oj

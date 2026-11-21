@@ -33,3 +33,15 @@ and 10 (D-070). Every spec file is now under 400 lines and every model under
 500 (largest: 02 at 399, `calc_graph.qnt` at 486). The split is by script
 (`use` between the parts, `// spec:` tags repointed, gate green). New material
 goes into new files instead of growing a large one.
+
+## Regulation traceability front end (user, 2026-11-21)
+
+A web front end (Phoenix LiveView and Ash, in the control plane's stack) to
+track and link all correspondences between regulations, specs, models, code
+and tests. Starting point: D-084 tags and `tools/reg-trace.sh`; design notes in
+`docs/guide/03-from-regulation-to-test.md` ("Toward a web front end").
+Decided (user, 2026-11-21): the app is a read model, not editable; the tags in
+the repository stay authoritative. `reg-trace.sh --check` is in `veridian-spec-check`. Also open: extract paragraph lists of each
+regulation (ids and titles only) so the app can show coverage; tags across
+specs 11, 19, 19c, 22. Not started.
+

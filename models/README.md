@@ -55,6 +55,11 @@ a negative control: the gate requires it to violate `noOrphanedReport`.
 
 ## Exhaustive checking with Apalache (investigated 2026-11-17)
 
+User, 2026-11-21: when the time comes, Apalache is available as a flake at
+https://github.com/apalache-mc/apalache/. The investigation below found the
+flake exposed only a build shell; recheck what it exposes today, and pin it in
+the lock, before relying on it.
+
 - **Packaging.** nixpkgs has no Apalache package. The repository's `flake.nix`
   (github:apalache-mc/apalache) exposes only a development shell for building
   Apalache (`devShell` and `packages.<system>.dev-shell`), not an Apalache

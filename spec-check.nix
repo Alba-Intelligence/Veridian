@@ -145,7 +145,8 @@ in
   '';
 
   # The check required before every commit that touches a spec or a model
-  # (D-055): Allium check, traceability both ways, then the model checks.
+  # (D-055): Allium check, traceability both ways, regulation tags (D-084), then
+  # the model checks.
   scripts.veridian-spec-check.exec = ''
     set -eu
     out="$(mktemp)"
@@ -155,6 +156,7 @@ in
     fi
     echo "allium check: no errors"
     models/trace_check.sh
+    tools/reg-trace.sh --check
     veridian-quint-check
   '';
 }

@@ -52,6 +52,7 @@ contract FrtbStandardisedApproach {
     default_risk_charge: (positions: Set<data/InputVersion>, reference_data: Set<data/InputVersion>, parameters_hash: String, reporting_currency: String) -> String
 
     @invariant PrescribedShifts
+        -- reg: MAR21.16 MAR21.17 MAR21.19-24 MAR21.25
         -- Delta: change in value for the prescribed shift divided by the
         -- shift (MAR21.19-21.24). Vega: vega times implied volatility, mapped
         -- to option maturity tenors 0.5, 1, 3, 5, 10 years (MAR21.25). Any

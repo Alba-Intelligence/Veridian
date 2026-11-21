@@ -1,3 +1,4 @@
+# model: calc_graph (read by tools/reg-trace.sh, D-084)
 defmodule Veridian.LedgerReplayTest do
   @moduledoc """
   Replays the model's traces against the PostgreSQL ledger (`Veridian.Ledger`),
